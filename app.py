@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_overlap_2025_separate_pc_hist.py
+# app_cronotrigo_predweem_base_2025_hist_seco_humedo_pc.py
 # CRONOTRIGO (web) + PREDWEEM:
 # - Serie BASE (2025) con % EMERREL en PC / Total y sombreado del PC
-# - Serie HISTÓRICA (otro(s) año/s) con el PC proyectado a cada año, sombreado y su % EMERREL en PC / Total
-# - Paneles separados para BASE e HISTÓRICO
+# - Serie HISTÓRICO SECO y HISTÓRICO HÚMEDO (otros años) con PC proyectado por año y métricas por año
+# - Paneles separados (BASE, HIST SECO, HIST HÚMEDO)
 # - Sin tabla visual de CRONOTRIGO; sin gráfico de EMEAC
-# - Acepta histórico con columnas 'fecha' y 'EMEREL' (como prueba.xlsx) o EMERREL/EMERAC
+# - Acepta histórico(s) con columnas 'fecha' y 'EMEREL' o EMERREL/EMERAC
 # - Manejo robusto CSV/XLSX (openpyxl opcional para XLSX)
 
 import io, re, zipfile, calendar
@@ -27,7 +27,7 @@ except Exception:
     _BS4_OK = False
 
 # ================== UI ==================
-st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Base 2025 + Histórico con PC", layout="wide")
+st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Base 2025 + Hist Seco/Húmedo con PC", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -35,7 +35,7 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTRIGO + PREDWEEM · Base (2025) + Histórico (PC proyectado por año)")
+st.title("CRONOTRIGO + PREDWEEM · Base (2025) + Históricos (Seco/Húmedo) con PC")
 
 # ==== Horizonte fijo para la serie BASE ====
 HORIZ_INI = pd.Timestamp("2025-02-01")
@@ -288,15 +288,17 @@ with st.sidebar:
     pc_fin_manual = st.date_input("Fin PC (manual)", value=None, format="DD/MM/YYYY")
 
     st.markdown("---")
-    st.header("PREDWEEM · Series")
+    st.header("PREDWEEM · Serie BASE")
     modo_pred = st.radio("Origen serie BASE (2025)", ["CSV público", "Subir archivo (EMERREL/EMERAC)", "API MeteoBahía (XML)"], index=0)
-
-    st.caption("HISTÓRICO (otro año) — formato simple aceptado: columnas **fecha** y **EMEREL**, o EMERREL/EMERAC.")
-    hist_file = st.file_uploader("Archivo HISTÓRICO (CSV/XLSX) — panel APARTE", type=["csv","xlsx"], key="hist_up")
-    st.caption("💡 Para XLSX, instalá 'openpyxl'; con CSV no hace falta.")
-
     pred_file = st.file_uploader("Archivo BASE (CSV/XLSX)", type=["csv","xlsx"], key="pred_up") if modo_pred=="Subir archivo (EMERREL/EMERAC)" else None
     meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml") if modo_pred=="API MeteoBahía (XML)" else None
+
+    st.markdown("---")
+    st.header("PREDWEEM · Históricos (archivos aparte)")
+    st.caption("Formato simple aceptado: columnas **fecha** y **EMEREL**, o EMERREL/EMERAC (CSV/XLSX).")
+    hist_seco_file = st.file_uploader("HISTÓRICO SECO (CSV/XLSX)", type=["csv","xlsx"], key="hist_seco")
+    hist_humedo_file = st.file_uploader("HISTÓRICO HÚMEDO (CSV/XLSX)", type=["csv","xlsx"], key="hist_humedo")
+    st.caption("💡 Para XLSX, instalá 'openpyxl'; con CSV no hace falta.")
 
 # ================== CRONOTRIGO: Visualización / PC (origen base) ==================
 st.subheader("CRONOTRIGO – Resultados FAUBA (para BASE 2025)")
@@ -334,11 +336,13 @@ if (pc_inicio is None or pc_fin is None) and pc_manual_on:
         pc_inicio = pd.to_datetime(pc_ini_manual)
         pc_fin = pd.to_datetime(pc_fin_manual)
 
-# ================== PREDWEEM: Serie BASE + HISTÓRICA ==================
+# ================== PREDWEEM: Serie BASE + HISTÓRICOS ==================
 st.subheader("Serie BASE (2025)")
 pred_vis_main = None
-pred_vis_hist = None
+pred_vis_seco = None
+pred_vis_humedo = None
 
+# --- BASE ---
 try:
     if modo_pred == "CSV público":
         df_meteo = load_public_csv()
@@ -366,18 +370,31 @@ except RuntimeError as e:
 except Exception as e:
     st.error(f"No se pudo generar la serie BASE: {e}")
 
-# HISTÓRICO (otro año) — NO se recorta al 2025
-if hist_file is not None:
+# --- HISTÓRICO SECO ---
+if hist_seco_file is not None:
     try:
-        pred_vis_hist = run_predweem_from_file(hist_file)
-        st.success(f"HISTÓRICO (otro año) cargado: {len(pred_vis_hist)} días.")
+        pred_vis_seco = run_predweem_from_file(hist_seco_file)
+        st.success(f"HISTÓRICO SECO cargado: {len(pred_vis_seco)} días.")
     except RuntimeError as e:
         if "OPENPYXL_MISSING" in str(e):
-            st.warning("No se pudo leer el HISTÓRICO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            st.warning("No se pudo leer el HISTÓRICO SECO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
         else:
-            st.error(f"No se pudo leer el HISTÓRICO: {e}")
+            st.error(f"No se pudo leer el HISTÓRICO SECO: {e}")
     except Exception as e:
-        st.error(f"No se pudo leer el HISTÓRICO: {e}")
+        st.error(f"No se pudo leer el HISTÓRICO SECO: {e}")
+
+# --- HISTÓRICO HÚMEDO ---
+if hist_humedo_file is not None:
+    try:
+        pred_vis_humedo = run_predweem_from_file(hist_humedo_file)
+        st.success(f"HISTÓRICO HÚMEDO cargado: {len(pred_vis_humedo)} días.")
+    except RuntimeError as e:
+        if "OPENPYXL_MISSING" in str(e):
+            st.warning("No se pudo leer el HISTÓRICO HÚMEDO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+        else:
+            st.error(f"No se pudo leer el HISTÓRICO HÚMEDO: {e}")
+    except Exception as e:
+        st.error(f"No se pudo leer el HISTÓRICO HÚMEDO: {e}")
 
 # --- Recorte de horizonte SOLO para la BASE ---
 if pred_vis_main is not None:
@@ -459,7 +476,7 @@ if pred_vis_main is not None and len(pred_vis_main):
     # Referencias y PC
     fig_base.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
     fig_base.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
-    add_pc_shading(fig_base, pc_inicio, pc_fin, label="Período crítico (BASE)")
+    add_pc_shading(fig_base, pc_inicio, pc_fin, label="PC (BASE)")
     fig_base.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
                            height=520, legend_title="Referencias")
     st.plotly_chart(fig_base, use_container_width=True, theme="streamlit")
@@ -474,63 +491,74 @@ if pred_vis_main is not None and len(pred_vis_main):
     else:
         st.warning("PC inválido o fuera del horizonte para la BASE.")
 
-# ================== Grafico HISTÓRICO (con PC proyectado) + métricas por año ==================
-if pred_vis_hist is not None and len(pred_vis_hist):
-    hist_plot = pred_vis_hist.copy()
-    if "Nivel" not in hist_plot.columns:
-        hist_plot["Nivel"] = np.where(hist_plot["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
-                               np.where(hist_plot["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
+# ================== Panel HISTÓRICO genérico (función) ==================
+def render_hist_panel(hist_plot: pd.DataFrame | None, titulo: str, fill_hex: str = "#888888"):
+    if hist_plot is None or len(hist_plot)==0:
+        st.info(f"No hay datos para **{titulo}**.")
+        return None, []
 
-    st.subheader("HISTÓRICO (otro año) · EMERREL diario (MA5 + PC proyectado por año)")
-    fig_hist = go.Figure()
+    dfp = hist_plot.copy()
+    if "Nivel" not in dfp.columns:
+        dfp["Nivel"] = np.where(dfp["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
+                         np.where(dfp["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
+
+    st.subheader(f"{titulo} · EMERREL diario (MA5 + PC proyectado por año)")
+    fig = go.Figure()
     # MA5 área + línea
-    fig_hist.add_trace(go.Scatter(x=hist_plot["Fecha"], y=hist_plot["MA5"], mode="lines",
-                                  line=dict(width=0), fill="tozeroy", fillcolor=rgba("#888888",0.15),
-                                  showlegend=False, hoverinfo="skip"))
-    fig_hist.add_trace(go.Scatter(x=hist_plot["Fecha"], y=hist_plot["MA5"], mode="lines",
-                                  line=dict(width=2), name="HISTÓRICO · MA5",
-                                  hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=dfp["Fecha"], y=dfp["MA5"], mode="lines",
+                             line=dict(width=0), fill="tozeroy", fillcolor=rgba(fill_hex,0.15),
+                             showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=dfp["Fecha"], y=dfp["MA5"], mode="lines",
+                             line=dict(width=2), name=f"{titulo} · MA5",
+                             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"))
     # Barras por nivel
-    fig_hist.add_bar(x=hist_plot["Fecha"], y=hist_plot["EMERREL(0-1)"],
-                     marker=dict(color=colores_por_nivel(hist_plot["Nivel"]).tolist()),
-                     customdata=hist_plot["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
-                     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
-                     name="HISTÓRICO · EMERREL (0-1)")
-    # Referencias
-    fig_hist.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
-    fig_hist.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
+    fig.add_bar(x=dfp["Fecha"], y=dfp["EMERREL(0-1)"],
+                marker=dict(color=colores_por_nivel(dfp["Nivel"]).tolist()),
+                customdata=dfp["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
+                hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+                name=f"{titulo} · EMERREL (0-1)")
+    fig.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
+    fig.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
 
-    # Proyección del PC de BASE a cada año del histórico + sombreado
-    hist_years = sorted(pd.unique(hist_plot["Fecha"].dt.year.dropna()))
+    # Proyección del PC BASE a cada año del histórico + sombreado y métrica por año
+    hist_years = sorted(pd.unique(dfp["Fecha"].dt.year.dropna()))
     pc_metrics = []  # (year, pct)
     for y in hist_years:
-        if pc_inicio is None or pc_fin is None: 
+        if pc_inicio is None or pc_fin is None:
             continue
         h_i, h_f = project_pc_to_year(pc_inicio, pc_fin, int(y))
-        # sombreado por año
-        add_pc_shading(fig_hist, h_i, h_f, label=f"PC {y}")
-        # métrica por año (sobre datos de ese año)
-        sub_year = hist_plot[(hist_plot["Fecha"].dt.year == y)].copy()
+        add_pc_shading(fig, h_i, h_f, label=f"PC {y}")
+        sub_year = dfp[(dfp["Fecha"].dt.year == y)].copy()
         if not sub_year.empty:
             _, resy = compute_overlap(sub_year, h_i, h_f)
             pc_metrics.append((int(y), resy.get("% EMERREL en PC / total", np.nan)))
 
-    fig_hist.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
-                           height=520, legend_title="Referencias")
-    st.plotly_chart(fig_hist, use_container_width=True, theme="streamlit")
+    fig.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
+                      height=520, legend_title="Referencias")
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
-    # Métricas HISTÓRICO por año
-    st.subheader("Resultado (HISTÓRICO)")
+    # Métricas por año
+    st.caption("Métricas por año:")
     if pc_metrics:
-        # mostrar hasta 4 métricas por fila
         for i in range(0, len(pc_metrics), 4):
             row = pc_metrics[i:i+4]
             cols = st.columns(len(row))
             for (j, (yy, pct)) in enumerate(row):
-                cols[j].metric(f"% EMERREL en PC / Total (HIST {yy})", f"{pct:.0%}" if pd.notna(pct) else "—")
-        st.caption("El PC del histórico se proyecta usando las mismas fechas día/mes del PC BASE en cada año del histórico.")
+                cols[j].metric(f"% en PC / Total ({titulo} {yy})", f"{pct:.0%}" if pd.notna(pct) else "—")
     else:
-        st.info("No fue posible calcular métricas del histórico (verificá fechas o PC).")
+        st.info("No fue posible calcular métricas (verificá fechas o PC).")
+
+    return fig, pc_metrics
+
+# ================== Render HISTÓRICO SECO y HÚMEDO ==================
+fig_seco = fig_humedo = None
+metrics_seco = metrics_humedo = []
+
+if pred_vis_seco is not None and len(pred_vis_seco):
+    fig_seco, metrics_seco = render_hist_panel(pred_vis_seco, "HISTÓRICO SECO", fill_hex="#888888")
+
+if pred_vis_humedo is not None and len(pred_vis_humedo):
+    fig_humedo, metrics_humedo = render_hist_panel(pred_vis_humedo, "HISTÓRICO HÚMEDO", fill_hex="#1f77b4")
 
 # ================== Descargas ==================
 st.subheader("Descargas")
@@ -541,17 +569,23 @@ if pred_vis_main is not None and not pred_vis_main.empty:
     cols[0].download_button("⬇ BASE 2025 (CSV)", data=buf_p.getvalue(),
                             file_name="predweem_base_2025_clip.csv", mime="text/csv")
 
-if pred_vis_hist is not None and not pred_vis_hist.empty:
-    buf_h = io.StringIO(); pred_vis_hist.to_csv(buf_h, index=False)
-    cols[1].download_button("⬇ HISTÓRICO (CSV)", data=buf_h.getvalue(),
-                            file_name="predweem_historico.csv", mime="text/csv")
+if pred_vis_seco is not None and not pred_vis_seco.empty:
+    buf_s = io.StringIO(); pred_vis_seco.to_csv(buf_s, index=False)
+    cols[1].download_button("⬇ HISTÓRICO SECO (CSV)", data=buf_s.getvalue(),
+                            file_name="predweem_historico_seco.csv", mime="text/csv")
+
+if pred_vis_humedo is not None and not pred_vis_humedo.empty:
+    buf_h = io.StringIO(); pred_vis_humedo.to_csv(buf_h, index=False)
+    cols[2].download_button("⬇ HISTÓRICO HÚMEDO (CSV)", data=buf_h.getvalue(),
+                            file_name="predweem_historico_humedo.csv", mime="text/csv")
 
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
 zip_ready = any([
     pred_vis_main is not None and not pred_vis_main.empty,
-    pred_vis_hist is not None and not pred_vis_hist.empty
+    pred_vis_seco is not None and not pred_vis_seco.empty,
+    pred_vis_humedo is not None and not pred_vis_humedo.empty
 ])
 
 if zip_ready:
@@ -560,14 +594,19 @@ if zip_ready:
             if pred_vis_main is not None and not pred_vis_main.empty:
                 _b = io.StringIO(); pred_vis_main.to_csv(_b, index=False)
                 zf.writestr("predweem_base_2025_clip.csv", _b.getvalue())
-            if pred_vis_hist is not None and not pred_vis_hist.empty:
-                _b = io.StringIO(); pred_vis_hist.to_csv(_b, index=False)
-                zf.writestr("predweem_historico.csv", _b.getvalue())
+            if pred_vis_seco is not None and not pred_vis_seco.empty:
+                _b = io.StringIO(); pred_vis_seco.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_seco.csv", _b.getvalue())
+            if pred_vis_humedo is not None and not pred_vis_humedo.empty:
+                _b = io.StringIO(); pred_vis_humedo.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_humedo.csv", _b.getvalue())
             if 'fig_base' in locals() and fig_base is not None:
                 zf.writestr("grafico_base_2025.html", fig_to_html_bytes(fig_base))
-            if 'fig_hist' in locals() and fig_hist is not None:
-                zf.writestr("grafico_historico_pc.html", fig_to_html_bytes(fig_hist))
+            if 'fig_seco' in locals() and fig_seco is not None:
+                zf.writestr("grafico_historico_seco.html", fig_to_html_bytes(fig_seco))
+            if 'fig_humedo' in locals() and fig_humedo is not None:
+                zf.writestr("grafico_historico_humedo.html", fig_to_html_bytes(fig_humedo))
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
-                                file_name="cronotrigo_predweem_paquete_base_y_historico_pc.zip", mime="application/zip")
+                                file_name="cronotrigo_predweem_base_seco_humedo_pc.zip", mime="application/zip")
 
