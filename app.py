@@ -2,6 +2,7 @@
 # app_cronotrigo_predweem_overlap_2025_minimal.py
 # CRONOTRIGO (web) + PREDWEEM con overlap simplificado:
 # - Muestra SOLO "% EMERREL en PC / Total"
+# - Elimina la tabla de resultados del overlap (no se muestra DataFrame)
 # - Elimina el gráfico EMEAC
 # - Horizonte fijo 01/02/2025–01/11/2025 para datos, gráficos y overlap
 
@@ -172,7 +173,8 @@ def load_public_csv():
 def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Julian_days","TMAX","TMIN","Prec"]
     out = df.copy()
-    for c in cols: out[c] = pd.to_numeric(cast := df[c], errors="coerce")
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     out[cols] = out[cols].interpolate(limit_direction="both")
     out["Julian_days"] = out["Julian_days"].clip(1, 366)
     out["Prec"] = out["Prec"].clip(lower=0)
@@ -471,9 +473,8 @@ if pred_vis is not None and len(pred_vis):
         st.markdown(f"**Período crítico aplicado:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
                     f"· **Días:** {(pc_fin - pc_inicio).days + 1}")
 
-        if not overlap_df.empty:
-            st.dataframe(overlap_df, use_container_width=True)
-        else:
+        # No mostramos más la tabla de resultados (DataFrame) del overlap
+        if overlap_df.empty:
             st.info("No hay días del pronóstico/modelo dentro del Período Crítico en el horizonte.")
     else:
         st.warning("No se detectó/ingresó un Período Crítico válido en el horizonte 2025.")
@@ -494,7 +495,7 @@ if pred_vis is not None and not pred_vis.empty:
     cols[1].download_button("⬇ Serie PREDWEEM (CSV)", data=buf_p.getvalue(),
                             file_name="predweem_serie_2025_clip.csv", mime="text/csv")
 
-# Overlap (si existe)
+# Overlap (si existe) — mantenemos la descarga aunque no se muestre la tabla
 if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
     buf_o = io.StringIO(); overlap_df.to_csv(buf_o, index=False)
     cols[2].download_button("⬇ Overlap (PC × EMERREL) (CSV)", data=buf_o.getvalue(),
@@ -519,7 +520,6 @@ if zip_ready:
                 zf.writestr("overlap_predweem_pc_2025.csv", _b.getvalue())
             if 'fig_er' in locals() and fig_er is not None:
                 zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
-            # NOTA: No se incluye grafico_emeac.html porque eliminamos ese gráfico.
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_paquete_2025.zip", mime="application/zip")
