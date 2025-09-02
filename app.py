@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # app_cronotrigo_predweem_overlap_2025_compare.py
-# CRONOTRIGO (web) + PREDWEEM con overlap simplificado y comparación:
-# - CSV público + archivo histórico (EMERREL/EMERAC) en simultáneo
-# - Muestra SOLO "% EMERREL en PC / Total" (para cada serie disponible)
-# - No muestra tabla de CRONOTRIGO
-# - Elimina el gráfico EMEAC
+# CRONOTRIGO (web) + PREDWEEM con overlap y comparación:
+# - Acepta histórico con columnas: 'fecha' y 'EMEREL' (como en prueba.xlsx)
+# - CSV público + archivo histórico simultáneo
+# - Muestra SOLO "% EMERREL en PC / Total" (para cada serie)
+# - Sin tabla visual de CRONOTRIGO, sin gráfico EMEAC
 # - Horizonte fijo 01/02/2025–01/11/2025
+# - Manejo robusto CSV/XLSX (openpyxl opcional)
 
 import io, re, zipfile
 from pathlib import Path
@@ -17,7 +18,7 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import requests
 
-# === Import "seguro" BeautifulSoup (fallback si no está) ===
+# === BeautifulSoup opcional ===
 try:
     from bs4 import BeautifulSoup
     _BS4_OK = True
@@ -41,8 +42,7 @@ HORIZ_INI = pd.Timestamp("2025-02-01")
 HORIZ_FIN = pd.Timestamp("2025-11-01")
 
 def clip_horizon(df: pd.DataFrame | None, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame | None:
-    if df is None or len(df)==0 or "Fecha" not in df.columns:
-        return df
+    if df is None or len(df)==0 or "Fecha" not in df.columns: return df
     m = (df["Fecha"] >= start) & (df["Fecha"] <= end)
     out = df.loc[m].copy()
     if "Fecha" in out.columns:
@@ -50,20 +50,28 @@ def clip_horizon(df: pd.DataFrame | None, start: pd.Timestamp, end: pd.Timestamp
         out.reset_index(drop=True, inplace=True)
     return out
 
-def clip_pc(pc_i: pd.Timestamp | None, pc_f: pd.Timestamp | None,
-            start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    if pc_i is None or pc_f is None:
-        return (pc_i, pc_f)
-    a = max(pc_i, start)
-    b = min(pc_f, end)
-    if b < a:
-        return (None, None)
-    return (a, b)
+def clip_pc(pc_i, pc_f, start, end):
+    if pc_i is None or pc_f is None: return (pc_i, pc_f)
+    a, b = max(pc_i, start), min(pc_f, end)
+    return (a, b) if b >= a else (None, None)
 
 # ================== Utils ==================
+def _normalize_name(s: str) -> str:
+    # minúsculas + quitar espacios/símbolos
+    return re.sub(r"[^a-z0-9]", "", str(s).strip().lower())
+
 def _norm_col(df, aliases):
-    for a in aliases:
-        if a in df.columns: return a
+    """Match tolerante (case-insensitive, sin símbolos)."""
+    norm_map = {c: _normalize_name(c) for c in df.columns}
+    alias_norm = {_normalize_name(a) for a in aliases}
+    # match exacto por normalizado
+    for col, ncol in norm_map.items():
+        if ncol in alias_norm:
+            return col
+    # fallback: contiene alias como substring
+    for col, ncol in norm_map.items():
+        if any(a in ncol for a in alias_norm):
+            return col
     return None
 
 def _num(s, pct=False):
@@ -82,69 +90,33 @@ def rgba(hex_color, alpha=0.15):
 CRONOTRIGO_URL = "https://cronotrigo.agro.uba.ar/index.php/cronos/AR"
 DATE_PAT_HTML = re.compile(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?")
 
-def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
-    """Devuelve la tabla de riesgos (id='table-riesgos') o None si no está / falta bs4."""
-    if not _BS4_OK:
-        return None
-    soup = BeautifulSoup(html_text, "html.parser")
-    table = soup.find("table", {"id": "table-riesgos"})
-    if not table:
-        return None
-    headers = [th.get_text(strip=True) for th in table.find_all("th")]
-    rows = []
-    for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if not tds: continue
-        rows.append([td.get_text(strip=True) for td in tds])
-    if not rows:
-        return None
-    max_len = max(len(r) for r in rows)
-    rows = [r + [""] * (max_len - len(r)) for r in rows]
-    if not headers:
-        headers = [f"Columna {i+1}" for i in range(max_len)]
+def _extract_pc_from_html_text(html_text: str):
+    if _BS4_OK:
+        text = BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True)
     else:
-        headers = headers[:max_len] + [f"Columna {i+1}" for i in range(len(headers), max_len)]
-    return pd.DataFrame(rows, columns=headers)
-
-def _extract_pc_from_html_text(html_text: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """Intenta encontrar 'Período crítico' en el HTML (heurística con 2 fechas cercanas)."""
-    text = BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True) if _BS4_OK else html_text
+        text = html_text
     idx = text.lower().find("período crítico")
-    if idx == -1:
-        idx = text.lower().find("periodo critico")
-    if idx == -1:
-        return (None, None)
-    start = max(0, idx - 200)
-    end = min(len(text), idx + 200)
-    snippet = text[start:end]
-    dates = DATE_PAT_HTML.findall(snippet)
-    if len(dates) < 2:
-        dates = DATE_PAT_HTML.findall(text)
-        if len(dates) < 2:
-            return (None, None)
+    if idx == -1: idx = text.lower().find("periodo critico")
+    if idx == -1: return (None, None)
+    snippet = text[max(0, idx-200): min(len(text), idx+200)]
+    dates = DATE_PAT_HTML.findall(snippet) or DATE_PAT_HTML.findall(text)
+    if len(dates) < 2: return (None, None)
     year = pd.Timestamp.now().year
-    def mkdate(t):
+    def mk(t):
         d, m, y = int(t[0]), int(t[1]), t[2]
-        if y:
-            y = int(y) if len(y) == 4 else 2000 + int(y)
-        else:
-            y = year
-        try:
-            return pd.Timestamp(year=y, month=m, day=d)
-        except Exception:
-            return pd.NaT
-    d1 = mkdate(dates[0]); d2 = mkdate(dates[1])
-    if pd.isna(d1) or pd.isna(d2):
-        return (None, None)
-    if d2 < d1: d1, d2 = d2, d1
-    return (d1, d2)
+        y = int(y) if y and len(y)==4 else (2000+int(y) if y else year)
+        try: return pd.Timestamp(year=y, month=m, day=d)
+        except: return pd.NaT
+    d1, d2 = mk(dates[0]), mk(dates[1])
+    if pd.isna(d1) or pd.isna(d2): return (None, None)
+    return (min(d1,d2), max(d1,d2))
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_cronotrigo_html() -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36"}
-    resp = requests.get(CRONOTRIGO_URL, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(CRONOTRIGO_URL, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
 
 # ================== PREDWEEM ==================
 THR_BAJO_MEDIO = 0.020
@@ -155,11 +127,10 @@ FNAME_IW, FNAME_BIW, FNAME_LW, FNAME_BOUT = "IW.npy", "bias_IW.npy", "LW.npy", "
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_public_csv():
-    urls = [
+    for url in [
         "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
         "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
-    ]
-    for url in urls:
+    ]:
         try:
             df = pd.read_csv(url, parse_dates=["Fecha"])
             req = {"Fecha","Julian_days","TMAX","TMIN","Prec"}
@@ -206,7 +177,7 @@ class PracticalANNModel:
     def _norm(self, X):
         Xc = np.clip(X, self.input_min, self.input_max)
         return 2 * (Xc - self.input_min) / self._den - 1
-    def _denorm_out(self, y, ymin=-1, ymax=1):  # tansig^-1 normalizado a 0..1
+    def _denorm_out(self, y, ymin=-1, ymax=1):
         return (y - ymin) / (ymax - ymin)
     def predict(self, X_real, IW, b1, LW, b2):
         Xn = self._norm(X_real)
@@ -236,16 +207,61 @@ def run_predweem_simple(df_meteo: pd.DataFrame):
     out["MA5"] = out["EMERREL(0-1)"].rolling(5, min_periods=1).mean()
     return out
 
-def run_predweem_from_file(pred_file):
+# ==== Lectura flexible CSV/XLSX para EMERREL/EMERAC, incluyendo 'fecha' y 'EMEREL' ====
+def _read_table_any(pred_file):
+    """
+    Lee CSV o XLSX.
+    - CSV: pd.read_csv
+    - XLS/XLSX: requiere openpyxl. Si falta, lanza RuntimeError("OPENPYXL_MISSING")
+    """
     ext = Path(pred_file.name).suffix.lower()
-    df = pd.read_excel(pred_file) if ext in (".xls",".xlsx") else pd.read_csv(pred_file)
-    col_f = _norm_col(df, ["Fecha","date","Day","dia"])
-    if not col_f: raise ValueError("Archivo PREDWEEM debe incluir una columna de Fecha.")
+    if ext == ".csv":
+        return pd.read_csv(pred_file)
+    if ext in (".xls",".xlsx"):
+        try:
+            import openpyxl  # noqa
+        except Exception:
+            raise RuntimeError("OPENPYXL_MISSING")
+        return pd.read_excel(pred_file)
+    # intento final: tratar como CSV aunque la extensión sea rara
+    try:
+        pred_file.seek(0)
+        return pd.read_csv(pred_file)
+    except Exception:
+        raise ValueError("Formato no soportado. Usá CSV o instalá openpyxl para XLSX.")
+
+def run_predweem_from_file(pred_file):
+    df = _read_table_any(pred_file)
+
+    # Buscar columna de fecha: admite 'Fecha', 'fecha', 'date', 'day', 'dia'...
+    col_f = _norm_col(df, ["Fecha","fecha","date","day","dia","fecha(dd/mm/aaaa)","fecha_"])
+    if not col_f:
+        raise ValueError("El archivo debe incluir una columna de Fecha (p.ej. 'fecha').")
     df["Fecha"] = pd.to_datetime(df[col_f], dayfirst=True, errors="coerce")
-    col_e = _norm_col(df, ["EMERREL","EMERAC","EmergenciaRel","emerrel","emerac"])
-    if not col_e: raise ValueError("No se encontró EMERREL/EMERAC.")
-    ser = pd.to_numeric(df[col_e], errors="coerce").fillna(0.0)
-    if ser.max() > 1.0001: ser = ser / ser.max()
+
+    # Buscar columna de EMERREL diaria: admite EMERREL, EMEREL (1 sola R), EMERAC, etc.
+    col_e = _norm_col(df, [
+        "EMERREL","EMEREL","EMERAC","EmergenciaRel",
+        "emerrel","emerel","emerac","emergenciarel",
+        "EMERREL(0-1)","emergrel","emer_rel"
+    ])
+    if not col_e:
+        raise ValueError("No se encontró EMERREL/EMEREL/EMERAC en las columnas.")
+
+    # Normalizar números: admite coma decimal y '%'
+    s = df[col_e].astype(str).str.replace("%","", regex=False).str.replace(",",".", regex=False)
+    ser = pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+    # Normalización de escala:
+    # - si está en 0..100 → dividir por 100
+    # - si excede 1 pero no parece % → dividir por el máximo (llevar a 0..1)
+    m = float(ser.max()) if len(ser) else 0.0
+    if m > 1.0001:
+        if m <= 100.0:
+            ser = ser / 100.0
+        else:
+            ser = ser / m
+
     out = pd.DataFrame({"Fecha": pd.to_datetime(df["Fecha"]), "EMERREL(0-1)": ser}).sort_values("Fecha")
     out["EMERREL acumulado"] = out["EMERREL(0-1)"].cumsum().clip(upper=1.0)
     out["MA5"] = out["EMERREL(0-1)"].rolling(5, min_periods=1).mean()
@@ -271,40 +287,29 @@ def parse_meteobahia_xml(xml_text: str) -> pd.DataFrame:
     candidates = root.findall(".//dia") + root.findall(".//day") + root.findall(".//item")
     if not candidates: candidates = root.findall(".//*")
     for node in candidates:
-        def _grab(taglist):
-            for k in taglist:
+        def _g(keys):
+            for k in keys:
                 el = node.find(k)
                 if el is not None and el.text: return el.text.strip()
                 if node.get(k): return node.get(k)
             return None
-        date_txt = _grab(["fecha","date","day","dia","f"])
-        tmax = _grab(["tmax","TMAX","max","tx"])
-        tmin = _grab(["tmin","TMIN","min","tn"])
-        rain = _grab(["rain","prec","lluvia","pp","pr"])
+        date_txt = _g(["fecha","date","day","dia","f"])
+        tmax = _g(["tmax","TMAX","max","tx"])
+        tmin = _g(["tmin","TMIN","min","tn"])
+        rain = _g(["rain","prec","lluvia","pp","pr"])
         if not date_txt: continue
         dt_ = pd.to_datetime(date_txt, dayfirst=True, errors="coerce")
         rows.append({"Fecha": dt_, "TMAX": _num(tmax), "TMIN": _num(tmin), "Prec": max(_num(rain),0.0) if rain else 0.0})
     df = pd.DataFrame(rows).dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
     if df.empty: raise ValueError("XML sin días parseables.")
     df["Julian_days"] = df["Fecha"].dt.dayofyear
-    df = _sanitize_meteo(df[["Fecha","Julian_days","TMAX","TMIN","Prec"]])
-    return df
+    return _sanitize_meteo(df[["Fecha","Julian_days","TMAX","TMIN","Prec"]])
 
 # ================== Sidebar ==================
 with st.sidebar:
     st.header("CRONOTRIGO (Web)")
-    modo_crono = st.radio(
-        "Modo de integración",
-        ["Iframe (recomendado)", "Extraer tabla (vivo)", "Usar HTML subido"],
-        index=0
-    )
-    cronot_html_file = None
-    if modo_crono == "Usar HTML subido":
-        cronot_html_file = st.file_uploader(
-            "HTML exportado de CRONOTRIGO",
-            type=["html","htm"],
-            key="cronot_html"
-        )
+    modo_crono = st.radio("Modo de integración", ["Iframe (recomendado)", "Extraer tabla (vivo)", "Usar HTML subido"], index=0)
+    cronot_html_file = st.file_uploader("HTML exportado de CRONOTRIGO", type=["html","htm"], key="cronot_html") if modo_crono=="Usar HTML subido" else None
 
     st.markdown("---")
     st.header("Período Crítico (PC)")
@@ -317,44 +322,36 @@ with st.sidebar:
     st.header("PREDWEEM")
     modo_pred = st.radio("Origen de datos base", ["CSV público", "Subir archivo (EMERREL/EMERAC)", "API MeteoBahía (XML)"], index=0)
 
-    # Archivo histórico opcional para comparar (disponible en todos los modos)
-    hist_file = st.file_uploader("Archivo histórico opcional (CSV/XLSX) para comparar", type=["csv","xlsx"], key="hist_up")
+    # Histórico opcional para comparar — admite EXACTAMENTE el formato 'fecha' + 'EMEREL'
+    st.caption("Histórico opcional (CSV/XLSX) — formato simple aceptado: columnas **fecha** y **EMEREL**.")
+    hist_file = st.file_uploader("Archivo histórico opcional (CSV/XLSX)", type=["csv","xlsx"], key="hist_up")
+    st.caption("💡 Si subís XLSX, asegurate de tener 'openpyxl' instalado. Si no, usá CSV.")
 
-    pred_file = None; meteo_url = None
-    if modo_pred == "Subir archivo (EMERREL/EMERAC)":
-        pred_file = st.file_uploader("Archivo base (CSV/XLSX)", type=["csv","xlsx"], key="pred_up")
-    elif modo_pred == "API MeteoBahía (XML)":
-        meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml")
+    pred_file = st.file_uploader("Archivo base (CSV/XLSX)", type=["csv","xlsx"], key="pred_up") if modo_pred=="Subir archivo (EMERREL/EMERAC)" else None
+    meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml") if modo_pred=="API MeteoBahía (XML)" else None
 
 # ================== CRONOTRIGO: Visualización / PC ==================
 st.subheader("CRONOTRIGO – Resultados FAUBA")
 st.caption("Horizonte aplicado: 01/02/2025 → 01/11/2025")
 
-cronot_df = None
-pc_inicio = None
-pc_fin = None
-
+pc_inicio = pc_fin = None
 if modo_crono == "Iframe (recomendado)":
     components.iframe(CRONOTRIGO_URL, height=900, scrolling=True)
     st.caption("Si el sitio bloquea iframes, usá ‘Extraer tabla (vivo)’ o ‘Usar HTML subido’.")
     st.link_button("Abrir CRONOTRIGO en pestaña nueva", CRONOTRIGO_URL)
-
 elif modo_crono == "Extraer tabla (vivo)":
     with st.spinner("Consultando CRONOTRIGO…"):
         try:
             html_text = fetch_cronotrigo_html()
-            cronot_df = _scrape_cronotrigo_table(html_text)  # no se muestra
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
             st.success("Período Crítico detectado desde la página (si estaba presente).")
         except Exception as e:
             st.error(f"No pude leer CRONOTRIGO: {e}")
-
-else:  # "Usar HTML subido"
+else:
     if cronot_html_file is not None:
         try:
             html_text = cronot_html_file.read().decode("utf-8", errors="ignore")
-            cronot_df = _scrape_cronotrigo_table(html_text)  # no se muestra
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
             st.success("HTML leído y PC detectado (si estaba presente).")
@@ -363,7 +360,7 @@ else:  # "Usar HTML subido"
     else:
         st.info("Subí el archivo HTML para continuar.")
 
-# Si no se detectó PC y el usuario habilitó manual, uso lo ingresado
+# Si no se detectó PC y el usuario habilitó manual, usar manual
 if (pc_inicio is None or pc_fin is None) and pc_manual_on:
     if pc_ini_manual and pc_fin_manual:
         pc_inicio = pd.to_datetime(pc_ini_manual)
@@ -371,8 +368,8 @@ if (pc_inicio is None or pc_fin is None) and pc_manual_on:
 
 # ================== PREDWEEM: Serie base + histórico opcional ==================
 st.subheader("Serie PREDWEEM")
-pred_vis_main = None   # serie base (según modo)
-pred_vis_hist = None   # serie histórica opcional
+pred_vis_main = None
+pred_vis_hist = None
 
 try:
     if modo_pred == "CSV público":
@@ -384,8 +381,8 @@ try:
             pred_vis_main = run_predweem_from_file(pred_file)
             st.success(f"Base: archivo cargado ({len(pred_vis_main)} días).")
         else:
-            st.info("Subí el archivo base con Fecha y EMERREL/EMERAC.")
-    else:  # API MeteoBahía
+            st.info("Subí el archivo base con Fecha/EMERREL.")
+    else:
         if meteo_url and meteo_url.strip():
             xml_text = fetch_meteobahia_xml(meteo_url.strip())
             df_meteo = parse_meteobahia_xml(xml_text)
@@ -393,14 +390,24 @@ try:
             st.success(f"Base: PREDWEEM con API MeteoBahía: {len(pred_vis_main)} días.")
         else:
             st.info("Ingresá la URL del XML de MeteoBahía.")
+except RuntimeError as e:
+    if "OPENPYXL_MISSING" in str(e):
+        st.warning("Para leer XLSX necesitás 'openpyxl'. Subí un CSV como alternativa.")
+    else:
+        st.error(f"No se pudo generar la serie base: {e}")
 except Exception as e:
-    st.error(f"No se pudo generar la serie base de PREDWEEM: {e}")
+    st.error(f"No se pudo generar la serie base: {e}")
 
-# Histórico opcional (para comparar)
+# Histórico opcional
 if hist_file is not None:
     try:
         pred_vis_hist = run_predweem_from_file(hist_file)
         st.success(f"Histórico cargado para comparación: {len(pred_vis_hist)} días.")
+    except RuntimeError as e:
+        if "OPENPYXL_MISSING" in str(e):
+            st.warning("No se pudo leer el histórico: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+        else:
+            st.error(f"No se pudo leer el histórico: {e}")
     except Exception as e:
         st.error(f"No se pudo leer el histórico: {e}")
 
@@ -409,7 +416,6 @@ if pred_vis_main is not None:
     pred_vis_main = clip_horizon(pred_vis_main, HORIZ_INI, HORIZ_FIN)
     if pred_vis_main.empty:
         st.warning("No hay datos base de PREDWEEM en 01/02/2025 → 01/11/2025.")
-
 if pred_vis_hist is not None:
     pred_vis_hist = clip_horizon(pred_vis_hist, HORIZ_INI, HORIZ_FIN)
     if pred_vis_hist.empty:
@@ -425,7 +431,7 @@ def add_pc_shading(fig, pc_i, pc_f):
                       line_width=0, layer="below",
                       annotation_text="Período crítico", annotation_position="top left")
 
-def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, dict]:
+def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f):
     if pc_i is None or pc_f is None or pc_i >= pc_f or pred_df is None or pred_df.empty:
         return pd.DataFrame(), {}
     mask = (pred_df["Fecha"] >= pc_i) & (pred_df["Fecha"] <= pc_f)
@@ -433,8 +439,7 @@ def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, di
     emerrel_pc = float(sub["EMERREL(0-1)"].sum()) if len(sub) else 0.0
     emerrel_total = float(pred_df["EMERREL(0-1)"].sum())
     pct_pc_sobre_total = emerrel_pc / emerrel_total if emerrel_total > 0 else np.nan
-    resumen = {"% EMERREL en PC / total": pct_pc_sobre_total}
-    return sub.reset_index(drop=True), resumen
+    return sub.reset_index(drop=True), {"% EMERREL en PC / total": pct_pc_sobre_total}
 
 # ================== Gráfico EMERREL (comparación) ==================
 def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=("Alto","#d62728")):
@@ -446,13 +451,11 @@ overlap_main_df = overlap_hist_df = pd.DataFrame()
 overlap_main_res = overlap_hist_res = {}
 
 if pred_vis_main is not None and len(pred_vis_main):
-    # Asegurar 'Nivel'
     main_plot = pred_vis_main.copy()
     if "Nivel" not in main_plot.columns:
         main_plot["Nivel"] = np.where(main_plot["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
                                np.where(main_plot["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
 
-    # Histórico opcional
     hist_plot = None
     if pred_vis_hist is not None and len(pred_vis_hist):
         hist_plot = pred_vis_hist.copy()
@@ -463,7 +466,7 @@ if pred_vis_main is not None and len(pred_vis_main):
     st.subheader("EMERREL diario (MA5 + sombreado PC) · Comparación")
     fig_er = go.Figure()
 
-    # Base: barras por nivel + MA5
+    # Base: barras + MA5
     colors_main = colores_por_nivel(main_plot["Nivel"])
     fig_er.add_trace(go.Scatter(x=main_plot["Fecha"], y=main_plot["MA5"], mode="lines",
                                 line=dict(width=0), fill="tozeroy", fillcolor=rgba("#4169e1",0.15),
@@ -477,7 +480,7 @@ if pred_vis_main is not None and len(pred_vis_main):
                    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Base EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
                    name="Base · EMERREL (0-1)")
 
-    # Histórico: líneas (para no superponer barras)
+    # Histórico: líneas
     if hist_plot is not None:
         fig_er.add_trace(go.Scatter(x=hist_plot["Fecha"], y=hist_plot["MA5"], mode="lines",
                                     line=dict(width=2, dash="dash"),
@@ -488,7 +491,7 @@ if pred_vis_main is not None and len(pred_vis_main):
                                     name="Histórico · EMERREL (línea)",
                                     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Histórico EMERREL: %{y:.3f}<extra></extra>"))
 
-    # Líneas de referencia + PC
+    # Referencias + PC
     fig_er.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
     fig_er.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
     add_pc_shading(fig_er, pc_inicio, pc_fin)
@@ -496,31 +499,21 @@ if pred_vis_main is not None and len(pred_vis_main):
                          height=560, legend_title="Series")
     st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-    # --- OVERLAP: mostrar SOLO "% en PC / Total" para cada serie disponible ---
+    # --- OVERLAP: SOLO “% en PC / Total” para cada serie ---
     st.subheader("Overlap CRONOTRIGO × PREDWEEM — % en PC / Total")
-    cols = st.columns(2 if pred_vis_hist is not None and len(pred_vis_hist) else 1)
+    cols = st.columns(2 if hist_plot is not None else 1)
 
-    # Base
     if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
         overlap_main_df, overlap_main_res = compute_overlap(main_plot, pc_inicio, pc_fin)
         pct_main = overlap_main_res.get("% EMERREL en PC / total", np.nan)
         cols[0].metric("Base · % en PC / Total", f"{pct_main:.0%}" if pd.notna(pct_main) else "—")
-    else:
-        cols[0].warning("PC inválido o fuera del horizonte.")
-
-    # Histórico
-    if pred_vis_hist is not None and len(pred_vis_hist):
-        if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
+        if hist_plot is not None:
             overlap_hist_df, overlap_hist_res = compute_overlap(hist_plot, pc_inicio, pc_fin)
             pct_hist = overlap_hist_res.get("% EMERREL en PC / total", np.nan)
             cols[1].metric("Histórico · % en PC / Total", f"{pct_hist:.0%}" if pd.notna(pct_hist) else "—")
-        else:
-            cols[1].warning("PC inválido o fuera del horizonte.")
-
-    # Info PC aplicado
-    if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
-        st.caption(f"Período crítico aplicado: {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
-                   f"· Días: {(pc_fin - pc_inicio).days + 1}")
+        st.caption(f"PC aplicado: {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')} · Días: {(pc_fin - pc_inicio).days + 1}")
+    else:
+        cols[0].warning("PC inválido o fuera del horizonte.")
 else:
     st.info("Aún no hay serie base disponible para graficar.")
 
@@ -528,30 +521,20 @@ else:
 st.subheader("Descargas")
 cols = st.columns(4)
 
-# (Opcional) CSV de CRONOTRIGO para quien lo necesite (aunque no se muestra en pantalla)
-if cronot_df is not None and not cronot_df.empty:
-    buf_ct = io.StringIO(); cronot_df.to_csv(buf_ct, index=False)
-    cols[0].download_button("⬇ CRONOTRIGO (tabla, CSV)", data=buf_ct.getvalue(),
-                            file_name="cronotrigo_tabla_riesgos.csv", mime="text/csv")
-
-# Serie base
 if pred_vis_main is not None and not pred_vis_main.empty:
     buf_p = io.StringIO(); pred_vis_main.to_csv(buf_p, index=False)
-    cols[1].download_button("⬇ PREDWEEM base (CSV)", data=buf_p.getvalue(),
+    cols[0].download_button("⬇ PREDWEEM base (CSV)", data=buf_p.getvalue(),
                             file_name="predweem_base_2025_clip.csv", mime="text/csv")
 
-# Serie histórica (si existe)
 if pred_vis_hist is not None and not pred_vis_hist.empty:
     buf_h = io.StringIO(); pred_vis_hist.to_csv(buf_h, index=False)
-    cols[2].download_button("⬇ PREDWEEM histórico (CSV)", data=buf_h.getvalue(),
+    cols[1].download_button("⬇ PREDWEEM histórico (CSV)", data=buf_h.getvalue(),
                             file_name="predweem_historico_2025_clip.csv", mime="text/csv")
 
-# Overlaps (si existen)
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
 zip_ready = any([
-    cronot_df is not None and not (isinstance(cronot_df, pd.DataFrame) and cronot_df.empty),
     pred_vis_main is not None and not pred_vis_main.empty,
     pred_vis_hist is not None and not pred_vis_hist.empty
 ])
@@ -559,26 +542,14 @@ zip_ready = any([
 if zip_ready:
     with io.BytesIO() as mem:
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            if cronot_df is not None and not (isinstance(cronot_df, pd.DataFrame) and cronot_df.empty):
-                _b = io.StringIO(); cronot_df.to_csv(_b, index=False)
-                zf.writestr("cronotrigo_tabla_riesgos.csv", _b.getvalue())
             if pred_vis_main is not None and not pred_vis_main.empty:
                 _b = io.StringIO(); pred_vis_main.to_csv(_b, index=False)
                 zf.writestr("predweem_base_2025_clip.csv", _b.getvalue())
             if pred_vis_hist is not None and not pred_vis_hist.empty:
                 _b = io.StringIO(); pred_vis_hist.to_csv(_b, index=False)
                 zf.writestr("predweem_historico_2025_clip.csv", _b.getvalue())
-            # Overlaps por serie (si se calculó)
-            if 'overlap_main_df' in locals() and isinstance(overlap_main_df, pd.DataFrame) and not overlap_main_df.empty:
-                _b = io.StringIO(); overlap_main_df.to_csv(_b, index=False)
-                zf.writestr("overlap_predweem_base_pc_2025.csv", _b.getvalue())
-            if 'overlap_hist_df' in locals() and isinstance(overlap_hist_df, pd.DataFrame) and not overlap_hist_df.empty:
-                _b = io.StringIO(); overlap_hist_df.to_csv(_b, index=False)
-                zf.writestr("overlap_predweem_historico_pc_2025.csv", _b.getvalue())
-            # Gráfico EMERREL
             if 'fig_er' in locals() and fig_er is not None:
                 zf.writestr("grafico_emerrel_comparacion.html", fig_to_html_bytes(fig_er))
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_paquete_2025_comparacion.zip", mime="application/zip")
-
