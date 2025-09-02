@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # app_cronotrigo_predweem_web.py
-# CRONOTrigo + PREDWEEM integrado por WEB (sin OCR/imagenes)
+# CRONOTrigo + PREDWEEM por WEB (sin OCR / sin imágenes)
 # - Modo Iframe (embed)
-# - Modo Extraer tabla (requests + BeautifulSoup)
+# - Modo Extraer tabla (requests + BeautifulSoup, con fallback si bs4 no está)
 # - Modo HTML subido (lee tu .html guardado)
-# Tabla de riesgos identificada como id="table-riesgos" en el HTML oficial.
+# La tabla de riesgos se identifica por id="table-riesgos" en el HTML oficial.
 
 import io, re, zipfile
 from pathlib import Path
@@ -14,10 +14,16 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# ======= NEW: web components + scraping =======
 import streamlit.components.v1 as components
 import requests
-from bs4 import BeautifulSoup
+
+# == Import "seguro" de BeautifulSoup (fallback si no está instalada) ==
+try:
+    from bs4 import BeautifulSoup
+    _BS4_OK = True
+except Exception:
+    BeautifulSoup = None
+    _BS4_OK = False
 
 # ================== UI ==================
 st.set_page_config(page_title="CRONOTrigo + PREDWEEM (Web)", layout="wide")
@@ -52,15 +58,24 @@ def rgba(hex_color, alpha=0.15):
 CRONOTRIGO_URL = "https://cronotrigo.agro.uba.ar/index.php/cronos/AR"
 
 def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
-    """Devuelve la tabla de riesgos como DataFrame (id='table-riesgos') o None si no se encuentra."""
+    """
+    Devuelve la tabla de riesgos como DataFrame (id='table-riesgos') o None si
+    no se encuentra o si no está instalada BeautifulSoup.
+    """
+    if not _BS4_OK:
+        st.warning(
+            "No está instalada BeautifulSoup (beautifulsoup4). "
+            "Mostrando solo el iframe. Para habilitar el scraping, agregá "
+            "`beautifulsoup4` a requirements.txt e instalá dependencias."
+        )
+        return None
+
     soup = BeautifulSoup(html_text, "html.parser")
-    table = soup.find("table", {"id": "table-riesgos"})  # presente en el HTML oficial:contentReference[oaicite:1]{index=1}
+    table = soup.find("table", {"id": "table-riesgos"})  # selector del HTML oficial
     if not table:
         return None
 
-    # headers
     headers = [th.get_text(strip=True) for th in table.find_all("th")]
-    # rows
     rows = []
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
@@ -78,8 +93,7 @@ def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
     else:
         headers = headers[:max_len] + [f"Columna {i+1}" for i in range(len(headers), max_len)]
 
-    df = pd.DataFrame(rows, columns=headers)
-    return df
+    return pd.DataFrame(rows, columns=headers)
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_cronotrigo_html() -> str:
@@ -160,9 +174,9 @@ class PracticalANNModel:
     def predict(self, X_real):
         Xn = self._norm(X_real)
         z1 = Xn @ self.IW + self.b1
-        a1 = self._tansig(z1)
+        a1 = np.tanh(z1)
         z2 = (a1 @ self.LW.T).ravel() + self.b2
-        y  = self._tansig(z2)
+        y  = np.tanh(z2)
         y  = self._denorm_out(y)  # 0..1
         ac = np.cumsum(y) / 8.05
         diff = np.diff(ac, prepend=0)
@@ -283,7 +297,7 @@ elif modo_crono == "Extraer tabla (vivo)":
                 st.success("Tabla de riesgos extraída correctamente.")
                 st.dataframe(cronot_df, use_container_width=True)
             else:
-                st.warning("No se encontró la tabla en la página. Probá ‘Usar HTML subido’.")
+                st.warning("No se encontró la tabla en la página o falta BeautifulSoup. Probá ‘Usar HTML subido’.")
         except Exception as e:
             st.error(f"No pude leer Cronotrigo: {e}")
 
@@ -414,3 +428,4 @@ if zip_ready:
         mem.seek(0)
         cols[2].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
+
