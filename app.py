@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_overlap_2025_minimal.py
-# CRONOTRIGO (web) + PREDWEEM con overlap simplificado:
-# - Muestra SOLO "% EMERREL en PC / Total"
-# - No muestra tabla de CRONOTRIGO en pantalla
-# - Elimina el gráfico EMEAC y la tabla de resultados del overlap
-# - Horizonte fijo 01/02/2025–01/11/2025 para datos, gráficos y overlap
+# app_cronotrigo_predweem_overlap_2025_compare.py
+# CRONOTRIGO (web) + PREDWEEM con overlap simplificado y comparación:
+# - CSV público + archivo histórico (EMERREL/EMERAC) en simultáneo
+# - Muestra SOLO "% EMERREL en PC / Total" (para cada serie disponible)
+# - No muestra tabla de CRONOTRIGO
+# - Elimina el gráfico EMEAC
+# - Horizonte fijo 01/02/2025–01/11/2025
 
 import io, re, zipfile
 from pathlib import Path
@@ -25,7 +26,7 @@ except Exception:
     _BS4_OK = False
 
 # ================== UI ==================
-st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Overlap 2025", layout="wide")
+st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Overlap 2025 (Comparación)", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -33,7 +34,7 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTRIGO + PREDWEEM · Overlap (horizonte 2025)")
+st.title("CRONOTRIGO + PREDWEEM · Overlap (horizonte 2025) · Comparación")
 
 # ==== Horizonte fijo 2025 ====
 HORIZ_INI = pd.Timestamp("2025-02-01")
@@ -314,10 +315,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("PREDWEEM")
-    modo_pred = st.radio("Origen de datos", ["Subir archivo (EMERREL/EMERAC)", "CSV público", "API MeteoBahía (XML)"], index=0)
+    modo_pred = st.radio("Origen de datos base", ["CSV público", "Subir archivo (EMERREL/EMERAC)", "API MeteoBahía (XML)"], index=0)
+
+    # Archivo histórico opcional para comparar (disponible en todos los modos)
+    hist_file = st.file_uploader("Archivo histórico opcional (CSV/XLSX) para comparar", type=["csv","xlsx"], key="hist_up")
+
     pred_file = None; meteo_url = None
     if modo_pred == "Subir archivo (EMERREL/EMERAC)":
-        pred_file = st.file_uploader("CSV/XLSX diario", type=["csv","xlsx"], key="pred_up")
+        pred_file = st.file_uploader("Archivo base (CSV/XLSX)", type=["csv","xlsx"], key="pred_up")
     elif modo_pred == "API MeteoBahía (XML)":
         meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml")
 
@@ -338,9 +343,8 @@ elif modo_crono == "Extraer tabla (vivo)":
     with st.spinner("Consultando CRONOTRIGO…"):
         try:
             html_text = fetch_cronotrigo_html()
-            # (NO mostrar tabla en pantalla)
-            cronot_df = _scrape_cronotrigo_table(html_text)  # útil para descarga si se quiere
-            p1, p2 = _extract_pc_from_html_text(html_text)   # extrae PC
+            cronot_df = _scrape_cronotrigo_table(html_text)  # no se muestra
+            p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
             st.success("Período Crítico detectado desde la página (si estaba presente).")
         except Exception as e:
@@ -350,8 +354,7 @@ else:  # "Usar HTML subido"
     if cronot_html_file is not None:
         try:
             html_text = cronot_html_file.read().decode("utf-8", errors="ignore")
-            # (NO mostrar tabla en pantalla)
-            cronot_df = _scrape_cronotrigo_table(html_text)  # útil para descarga si se quiere
+            cronot_df = _scrape_cronotrigo_table(html_text)  # no se muestra
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
             st.success("HTML leído y PC detectado (si estaba presente).")
@@ -366,34 +369,51 @@ if (pc_inicio is None or pc_fin is None) and pc_manual_on:
         pc_inicio = pd.to_datetime(pc_ini_manual)
         pc_fin = pd.to_datetime(pc_fin_manual)
 
-# ================== PREDWEEM ==================
+# ================== PREDWEEM: Serie base + histórico opcional ==================
 st.subheader("Serie PREDWEEM")
-pred_vis = None
+pred_vis_main = None   # serie base (según modo)
+pred_vis_hist = None   # serie histórica opcional
+
 try:
-    if modo_pred == "Subir archivo (EMERREL/EMERAC)":
+    if modo_pred == "CSV público":
+        df_meteo = load_public_csv()
+        pred_vis_main = run_predweem_simple(df_meteo)
+        st.success(f"Base: PREDWEEM con meteo pública: {len(pred_vis_main)} días.")
+    elif modo_pred == "Subir archivo (EMERREL/EMERAC)":
         if pred_file:
-            pred_vis = run_predweem_from_file(pred_file); st.success(f"Serie cargada: {len(pred_vis)} días.")
+            pred_vis_main = run_predweem_from_file(pred_file)
+            st.success(f"Base: archivo cargado ({len(pred_vis_main)} días).")
         else:
-            st.info("Subí un archivo con Fecha y EMERREL/EMERAC.")
-    elif modo_pred == "CSV público":
-        df_meteo = load_public_csv(); pred_vis = run_predweem_simple(df_meteo)
-        st.success(f"PREDWEEM corrido con meteo pública: {len(pred_vis)} días.")
-    else:
+            st.info("Subí el archivo base con Fecha y EMERREL/EMERAC.")
+    else:  # API MeteoBahía
         if meteo_url and meteo_url.strip():
             xml_text = fetch_meteobahia_xml(meteo_url.strip())
             df_meteo = parse_meteobahia_xml(xml_text)
-            pred_vis = run_predweem_simple(df_meteo)
-            st.success(f"PREDWEEM corrido con API MeteoBahía: {len(pred_vis)} días.")
+            pred_vis_main = run_predweem_simple(df_meteo)
+            st.success(f"Base: PREDWEEM con API MeteoBahía: {len(pred_vis_main)} días.")
         else:
             st.info("Ingresá la URL del XML de MeteoBahía.")
 except Exception as e:
-    st.error(f"No se pudo generar la serie de PREDWEEM: {e}")
+    st.error(f"No se pudo generar la serie base de PREDWEEM: {e}")
 
-# --- Recorte de horizonte fijo 2025-02-01 a 2025-11-01 ---
-if pred_vis is not None:
-    pred_vis = clip_horizon(pred_vis, HORIZ_INI, HORIZ_FIN)
-    if pred_vis is None or pred_vis.empty:
-        st.warning("No hay datos de PREDWEEM en el horizonte 01/02/2025 → 01/11/2025.")
+# Histórico opcional (para comparar)
+if hist_file is not None:
+    try:
+        pred_vis_hist = run_predweem_from_file(hist_file)
+        st.success(f"Histórico cargado para comparación: {len(pred_vis_hist)} días.")
+    except Exception as e:
+        st.error(f"No se pudo leer el histórico: {e}")
+
+# --- Recorte de horizonte fijo ---
+if pred_vis_main is not None:
+    pred_vis_main = clip_horizon(pred_vis_main, HORIZ_INI, HORIZ_FIN)
+    if pred_vis_main.empty:
+        st.warning("No hay datos base de PREDWEEM en 01/02/2025 → 01/11/2025.")
+
+if pred_vis_hist is not None:
+    pred_vis_hist = clip_horizon(pred_vis_hist, HORIZ_INI, HORIZ_FIN)
+    if pred_vis_hist.empty:
+        st.warning("No hay datos del histórico en 01/02/2025 → 01/11/2025.")
 
 # Ajustar PC al mismo horizonte
 pc_inicio, pc_fin = clip_pc(pc_inicio, pc_fin, HORIZ_INI, HORIZ_FIN)
@@ -416,99 +436,149 @@ def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, di
     resumen = {"% EMERREL en PC / total": pct_pc_sobre_total}
     return sub.reset_index(drop=True), resumen
 
-# ================== Gráfico EMERREL ==================
+# ================== Gráfico EMERREL (comparación) ==================
 def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=("Alto","#d62728")):
     mp = {pal[0]: pal[1], pb[0]: pb[1], pa[0]: pa[1]}
     return serie.map(mp).fillna("#808080").to_numpy()
 
 fig_er = None
-overlap_df = pd.DataFrame()
-overlap_res = {}
+overlap_main_df = overlap_hist_df = pd.DataFrame()
+overlap_main_res = overlap_hist_res = {}
 
-if pred_vis is not None and len(pred_vis):
-    pred_plot = pred_vis.copy()
-    if "Nivel" not in pred_plot.columns:
-        th1, th2 = THR_BAJO_MEDIO, THR_MEDIO_ALTO
-        pred_plot["Nivel"] = np.where(pred_plot["EMERREL(0-1)"] <= th1, "Bajo",
-                               np.where(pred_plot["EMERREL(0-1)"] <= th2, "Medio", "Alto"))
+if pred_vis_main is not None and len(pred_vis_main):
+    # Asegurar 'Nivel'
+    main_plot = pred_vis_main.copy()
+    if "Nivel" not in main_plot.columns:
+        main_plot["Nivel"] = np.where(main_plot["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
+                               np.where(main_plot["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
 
-    st.subheader("EMERREL diario (MA5 + sombreado PC)")
-    colors = colores_por_nivel(pred_plot["Nivel"])
+    # Histórico opcional
+    hist_plot = None
+    if pred_vis_hist is not None and len(pred_vis_hist):
+        hist_plot = pred_vis_hist.copy()
+        if "Nivel" not in hist_plot.columns:
+            hist_plot["Nivel"] = np.where(hist_plot["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
+                                   np.where(hist_plot["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
+
+    st.subheader("EMERREL diario (MA5 + sombreado PC) · Comparación")
     fig_er = go.Figure()
-    fig_er.add_trace(go.Scatter(x=pred_plot["Fecha"], y=pred_plot["MA5"], mode="lines",
+
+    # Base: barras por nivel + MA5
+    colors_main = colores_por_nivel(main_plot["Nivel"])
+    fig_er.add_trace(go.Scatter(x=main_plot["Fecha"], y=main_plot["MA5"], mode="lines",
                                 line=dict(width=0), fill="tozeroy", fillcolor=rgba("#4169e1",0.15),
                                 showlegend=False, hoverinfo="skip"))
-    fig_er.add_trace(go.Scatter(x=pred_plot["Fecha"], y=pred_plot["MA5"], mode="lines",
-                                line=dict(width=2), name="MA5",
-                                hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"))
-    fig_er.add_bar(x=pred_plot["Fecha"], y=pred_plot["EMERREL(0-1)"],
-                   marker=dict(color=colors.tolist()),
-                   customdata=pred_plot["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
-                   hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
-                   name="EMERREL (0-1)")
+    fig_er.add_trace(go.Scatter(x=main_plot["Fecha"], y=main_plot["MA5"], mode="lines",
+                                line=dict(width=2), name="Base · MA5",
+                                hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Base MA5: %{y:.3f}<extra></extra>"))
+    fig_er.add_bar(x=main_plot["Fecha"], y=main_plot["EMERREL(0-1)"],
+                   marker=dict(color=colors_main.tolist()),
+                   customdata=main_plot["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
+                   hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Base EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+                   name="Base · EMERREL (0-1)")
+
+    # Histórico: líneas (para no superponer barras)
+    if hist_plot is not None:
+        fig_er.add_trace(go.Scatter(x=hist_plot["Fecha"], y=hist_plot["MA5"], mode="lines",
+                                    line=dict(width=2, dash="dash"),
+                                    name="Histórico · MA5",
+                                    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Histórico MA5: %{y:.3f}<extra></extra>"))
+        fig_er.add_trace(go.Scatter(x=hist_plot["Fecha"], y=hist_plot["EMERREL(0-1)"], mode="lines",
+                                    line=dict(width=1),
+                                    name="Histórico · EMERREL (línea)",
+                                    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Histórico EMERREL: %{y:.3f}<extra></extra>"))
+
+    # Líneas de referencia + PC
     fig_er.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
     fig_er.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
     add_pc_shading(fig_er, pc_inicio, pc_fin)
     fig_er.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
-                         height=520, legend_title="Referencias")
+                         height=560, legend_title="Series")
     st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-    # --- OVERLAP (solo % en PC / Total) ---
-    st.subheader("Overlap CRONOTRIGO × PREDWEEM")
-    if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
-        overlap_df, overlap_res = compute_overlap(pred_plot, pc_inicio, pc_fin)
-        pct_pc_tot = overlap_res.get("% EMERREL en PC / total", np.nan)
-        st.metric("% EMERREL en PC / Total", f"{pct_pc_tot:.0%}" if pd.notna(pct_pc_tot) else "—")
+    # --- OVERLAP: mostrar SOLO "% en PC / Total" para cada serie disponible ---
+    st.subheader("Overlap CRONOTRIGO × PREDWEEM — % en PC / Total")
+    cols = st.columns(2 if pred_vis_hist is not None and len(pred_vis_hist) else 1)
 
-        st.markdown(f"**Período crítico aplicado:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
-                    f"· **Días:** {(pc_fin - pc_inicio).days + 1}")
-        # NO mostramos la tabla del overlap
-        if overlap_df.empty:
-            st.info("No hay días del pronóstico/modelo dentro del Período Crítico en el horizonte.")
+    # Base
+    if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
+        overlap_main_df, overlap_main_res = compute_overlap(main_plot, pc_inicio, pc_fin)
+        pct_main = overlap_main_res.get("% EMERREL en PC / total", np.nan)
+        cols[0].metric("Base · % en PC / Total", f"{pct_main:.0%}" if pd.notna(pct_main) else "—")
     else:
-        st.warning("No se detectó/ingresó un Período Crítico válido en el horizonte 2025.")
+        cols[0].warning("PC inválido o fuera del horizonte.")
+
+    # Histórico
+    if pred_vis_hist is not None and len(pred_vis_hist):
+        if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
+            overlap_hist_df, overlap_hist_res = compute_overlap(hist_plot, pc_inicio, pc_fin)
+            pct_hist = overlap_hist_res.get("% EMERREL en PC / total", np.nan)
+            cols[1].metric("Histórico · % en PC / Total", f"{pct_hist:.0%}" if pd.notna(pct_hist) else "—")
+        else:
+            cols[1].warning("PC inválido o fuera del horizonte.")
+
+    # Info PC aplicado
+    if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
+        st.caption(f"Período crítico aplicado: {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
+                   f"· Días: {(pc_fin - pc_inicio).days + 1}")
+else:
+    st.info("Aún no hay serie base disponible para graficar.")
 
 # ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
 
-# (Opcional) CSV de CRONOTRIGO para quien lo necesite (aunque no lo mostramos en pantalla)
-if cronot_df is not None:
+# (Opcional) CSV de CRONOTRIGO para quien lo necesite (aunque no se muestra en pantalla)
+if cronot_df is not None and not cronot_df.empty:
     buf_ct = io.StringIO(); cronot_df.to_csv(buf_ct, index=False)
-    cols[0].download_button("⬇ Tabla CRONOTRIGO (CSV)", data=buf_ct.getvalue(),
+    cols[0].download_button("⬇ CRONOTRIGO (tabla, CSV)", data=buf_ct.getvalue(),
                             file_name="cronotrigo_tabla_riesgos.csv", mime="text/csv")
 
-# Serie PREDWEEM (si existe)
-if pred_vis is not None and not pred_vis.empty:
-    buf_p = io.StringIO(); pred_vis.to_csv(buf_p, index=False)
-    cols[1].download_button("⬇ Serie PREDWEEM (CSV)", data=buf_p.getvalue(),
-                            file_name="predweem_serie_2025_clip.csv", mime="text/csv")
+# Serie base
+if pred_vis_main is not None and not pred_vis_main.empty:
+    buf_p = io.StringIO(); pred_vis_main.to_csv(buf_p, index=False)
+    cols[1].download_button("⬇ PREDWEEM base (CSV)", data=buf_p.getvalue(),
+                            file_name="predweem_base_2025_clip.csv", mime="text/csv")
 
-# Overlap (si existe) — mantenemos la descarga aunque no se muestre tabla
-if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
-    buf_o = io.StringIO(); overlap_df.to_csv(buf_o, index=False)
-    cols[2].download_button("⬇ Overlap (PC × EMERREL) (CSV)", data=buf_o.getvalue(),
-                            file_name="overlap_predweem_pc_2025.csv", mime="text/csv")
+# Serie histórica (si existe)
+if pred_vis_hist is not None and not pred_vis_hist.empty:
+    buf_h = io.StringIO(); pred_vis_hist.to_csv(buf_h, index=False)
+    cols[2].download_button("⬇ PREDWEEM histórico (CSV)", data=buf_h.getvalue(),
+                            file_name="predweem_historico_2025_clip.csv", mime="text/csv")
 
-# Paquete ZIP (gráficos + datos disponibles)
+# Overlaps (si existen)
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
-zip_ready = (cronot_df is not None) or (pred_vis is not None and not pred_vis.empty)
+zip_ready = any([
+    cronot_df is not None and not (isinstance(cronot_df, pd.DataFrame) and cronot_df.empty),
+    pred_vis_main is not None and not pred_vis_main.empty,
+    pred_vis_hist is not None and not pred_vis_hist.empty
+])
+
 if zip_ready:
     with io.BytesIO() as mem:
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            if cronot_df is not None:
+            if cronot_df is not None and not (isinstance(cronot_df, pd.DataFrame) and cronot_df.empty):
                 _b = io.StringIO(); cronot_df.to_csv(_b, index=False)
                 zf.writestr("cronotrigo_tabla_riesgos.csv", _b.getvalue())
-            if pred_vis is not None and not pred_vis.empty:
-                _b = io.StringIO(); pred_vis.to_csv(_b, index=False)
-                zf.writestr("predweem_serie_2025_clip.csv", _b.getvalue())
-            if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
-                _b = io.StringIO(); overlap_df.to_csv(_b, index=False)
-                zf.writestr("overlap_predweem_pc_2025.csv", _b.getvalue())
+            if pred_vis_main is not None and not pred_vis_main.empty:
+                _b = io.StringIO(); pred_vis_main.to_csv(_b, index=False)
+                zf.writestr("predweem_base_2025_clip.csv", _b.getvalue())
+            if pred_vis_hist is not None and not pred_vis_hist.empty:
+                _b = io.StringIO(); pred_vis_hist.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_2025_clip.csv", _b.getvalue())
+            # Overlaps por serie (si se calculó)
+            if 'overlap_main_df' in locals() and isinstance(overlap_main_df, pd.DataFrame) and not overlap_main_df.empty:
+                _b = io.StringIO(); overlap_main_df.to_csv(_b, index=False)
+                zf.writestr("overlap_predweem_base_pc_2025.csv", _b.getvalue())
+            if 'overlap_hist_df' in locals() and isinstance(overlap_hist_df, pd.DataFrame) and not overlap_hist_df.empty:
+                _b = io.StringIO(); overlap_hist_df.to_csv(_b, index=False)
+                zf.writestr("overlap_predweem_historico_pc_2025.csv", _b.getvalue())
+            # Gráfico EMERREL
             if 'fig_er' in locals() and fig_er is not None:
-                zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
+                zf.writestr("grafico_emerrel_comparacion.html", fig_to_html_bytes(fig_er))
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
-                                file_name="cronotrigo_predweem_paquete_2025.zip", mime="application/zip")
+                                file_name="cronotrigo_predweem_paquete_2025_comparacion.zip", mime="application/zip")
+
