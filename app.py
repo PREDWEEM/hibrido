@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_ocr_diagnostics.py
-# CRONOTrigo + PREDWEEM con OCR optimizado, mensajes claros y diagnóstico visual
+# app_cronotrigo_predweem_no_cv2.py
+# CRONOTrigo + PREDWEEM con OCR optimizado (sin OpenCV)
 
 import io, re, zipfile, hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,13 +8,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import streamlit as st
 import plotly.graph_objects as go
-import cv2
 
-# =============== UI/LOCKDOWN ===============
-st.set_page_config(page_title="CRONOTrigo + PREDWEEM (OCR + Diagnóstico)", layout="wide")
+# ================== UI ==================
+st.set_page_config(page_title="CRONOTrigo + PREDWEEM (OCR sin OpenCV)", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -22,9 +21,9 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTrigo + PREDWEEM · OCR optimizado con diagnóstico")
+st.title("CRONOTrigo + PREDWEEM · OCR (sin OpenCV)")
 
-# =============== Helpers genéricos ===============
+# ================== Utils ==================
 def _norm_col(df, aliases):
     for a in aliases:
         if a in df.columns: return a
@@ -67,7 +66,6 @@ def _find_line(block, *needles):
             return ln.strip()
     return ""
 
-# ==== Helpers de diagnóstico de imagen / OCR ====
 def _human_kb(n):
     try: return f"{n/1024:.1f} KB"
     except: return "—"
@@ -75,15 +73,16 @@ def _human_kb(n):
 def _exif_orientation(img: Image.Image) -> str:
     try:
         exif = img.getexif() or {}
+        from PIL import ExifTags
         for k, v in exif.items():
-            tag = Image.ExifTags.TAGS.get(k, k)
+            tag = ExifTags.TAGS.get(k, k)
             if tag == "Orientation":
                 return {1:"Normal",3:"Rotada 180°",6:"90° CW",8:"90° CCW"}.get(v, str(v))
     except Exception:
         pass
     return "No disponible"
 
-# =============== OCR (RapidOCR preferido / pytesseract fallback) ===============
+# ================== OCR ==================
 @st.cache_resource(show_spinner=False)
 def _get_rapidocr():
     try:
@@ -96,113 +95,49 @@ if _get_rapidocr() is None:
     st.warning("No se pudo inicializar RapidOCR. Intentaré fallback con Tesseract si está disponible. "
                "Sugerencia: `pip install rapidocr-onnxruntime`.")
 
-def _preprocess_for_ocr(img: Image.Image, scale=2.5, invert=False, thr=None) -> Image.Image:
-    """resize -> CLAHE -> deskew -> binarización + morfología (robusto y rápido)."""
-    # Resize
+def _preprocess_for_ocr_purepil(img: Image.Image, scale=2.5, invert=False, thr=None) -> Image.Image:
+    """
+    Preprocesado sin OpenCV:
+    - Resize (LANCZOS)
+    - Autocontrast + incremento de contraste y nitidez
+    - Binarización simple por percentil/umbral
+    - Inversión opcional
+    """
     w, h = img.size
     img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+    g = ImageOps.grayscale(img2)
+    g = ImageOps.autocontrast(g)
+    g = ImageEnhance.Contrast(g).enhance(1.5)
+    g = ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=2).filter(g)
 
-    # A OpenCV
-    arr = np.array(img2.convert("RGB"))
-    g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    g = clahe.apply(g)
-
-    # Deskew (Hough)
-    edges = cv2.Canny(g, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=150)
-    angle = 0.0
-    if lines is not None and len(lines) > 5:
-        angles = [(theta - np.pi/2) for rho, theta in lines[:,0,:]]
-        angle = (np.mean(angles) * 180/np.pi)
-        angle = float(np.clip(angle, -5.0, 5.0))
-    if abs(angle) > 0.3:
-        M = cv2.getRotationMatrix2D((g.shape[1]//2, g.shape[0]//2), angle, 1.0)
-        g = cv2.warpAffine(g, M, (g.shape[1], g.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-    # Binarización
+    arr = np.asarray(g).astype(np.uint8)
     if thr is None:
-        th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 35, 11)
+        t = int(np.percentile(arr, 60))
     else:
-        _, th = cv2.threshold(g, thr, 255, cv2.THRESH_BINARY)
+        t = int(thr)
+    bin_arr = (arr > t).astype(np.uint8) * 255
+    out = Image.fromarray(bin_arr, mode="L")
     if invert:
-        th = cv2.bitwise_not(th)
-
-    # Morfología ligera
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
-    return Image.fromarray(th)
+        out = ImageOps.invert(out)
+    return out.convert("RGB")
 
 def _img_sha1(img_bytes: bytes) -> str:
     return hashlib.sha1(img_bytes).hexdigest()
 
-def _detect_text_regions(bin_img: np.ndarray):
-    """Cajas con texto en imagen binaria (0/255). Devuelve (x,y,w,h)."""
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15,3))
-    closed = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, k, iterations=1)
-    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    H, W = bin_img.shape[:2]
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        if w*h < 500: 
-            continue
-        if w < 30 or h < 12: 
-            continue
-        if (w/h) < 1.5 and h < 20:
-            continue
-        x0 = max(0, x-4); y0 = max(0, y-4)
-        x1 = min(W, x+w+4); y1 = min(H, y+h+4)
-        boxes.append((x0,y0,x1-x0,y1-y0))
-    boxes.sort(key=lambda b: (b[1], b[0]))
-    return boxes
-
-def _tile_generator(img: Image.Image, tile=900, overlap=160):
-    """Tiles con solape para captar texto pequeño sin sobredimensionar toda la imagen."""
-    W, H = img.size
-    xs = list(range(0, max(1, W - tile) + 1, max(1, tile - overlap)))
-    ys = list(range(0, max(1, H - tile) + 1, max(1, tile - overlap)))
-    for y in ys:
-        for x in xs:
-            yield (x, y, img.crop((x, y, min(x+tile, W), min(y+tile, H))))
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
     """
-    OCR optimizado:
-    - Preprocesado con CLAHE + deskew
-    - Detección de regiones + OCR por caja
-    - Tiling con solape (paralelo)
-    - Banda inferior (tarjetas) con OCR restringido a dígitos/fechas
+    OCR optimizado (sin OpenCV):
+    - Variantes globales (umbral +/-)
+    - Tiling con solape
+    - Banda inferior (tarjetas) con OCR focalizado (digits_only)
     """
     _ = _img_sha1(img_bytes) + f"|inv={int(bool(inv))}|thr={thr_ui}"
     base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     texts = []
 
-    # 1) Global: variantes
-    variants = []
-    for invert in ([False, True] if inv else [False]):
-        for thr in (thr_ui-20, thr_ui, thr_ui+20):
-            pre = _preprocess_for_ocr(base, scale=2.3, invert=invert, thr=max(50, min(220, thr)))
-            variants.append(pre)
-
-    # 2) Banda inferior (tarjetas)
-    W, H = base.size
-    y0 = int(H*0.58)
-    band = base.crop((0, y0, W, H))
-    band_pre = _preprocess_for_ocr(band, scale=3.0, invert=False, thr=thr_ui)
-    band_np = np.array(band_pre.convert("L"))
-    band_boxes = _detect_text_regions(band_np)
-
-    # 3) Tiles
-    tiles = list(_tile_generator(base, tile=900, overlap=160))
-
-    # 4) OCR paralelo
-    ocr = _get_rapidocr()
     def _ocr_pil(pil_im: Image.Image, digits_only=False) -> str:
+        ocr = _get_rapidocr()
         if ocr is not None:
             try:
                 res, _ = ocr(pil_im)
@@ -219,16 +154,39 @@ def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
         except Exception:
             return ""
 
+    # 1) Variantes globales
+    variants = []
+    for invert in ([False, True] if inv else [False]):
+        for thr in (thr_ui-20, thr_ui, thr_ui+20):
+            variants.append(_preprocess_for_ocr_purepil(base, scale=2.3, invert=invert, thr=max(50, min(220, thr))))
+
+    # 2) Banda inferior (tarjetas): OCR tal cual (sin detección de cajas)
+    W, H = base.size
+    y0 = int(H*0.58)
+    band = base.crop((0, y0, W, H))
+    band_pre = _preprocess_for_ocr_purepil(band, scale=3.0, invert=False, thr=thr_ui)
+
+    # 3) Tiles con solape
+    def _tiles(img: Image.Image, tile=900, overlap=160):
+        W, H = img.size
+        step = max(1, tile - overlap)
+        xs = list(range(0, max(1, W - tile) + 1, step))
+        ys = list(range(0, max(1, H - tile) + 1, step))
+        for y in ys:
+            for x in xs:
+                yield img.crop((x, y, min(x+tile, W), min(y+tile, H)))
+
+    # 4) Paralelizar OCR
     futures = []
     with ThreadPoolExecutor(max_workers=4) as ex:
         for pre in variants:
             futures.append(ex.submit(_ocr_pil, pre, False))
-        for x, y, tile in tiles:
-            pre_tile = _preprocess_for_ocr(tile, scale=2.0, invert=False, thr=thr_ui)
+        for tile in _tiles(base, tile=900, overlap=160):
+            pre_tile = _preprocess_for_ocr_purepil(tile, scale=2.0, invert=False, thr=thr_ui)
             futures.append(ex.submit(_ocr_pil, pre_tile, False))
-        for (x,y,w,h) in band_boxes[:20]:
-            crop = band_pre.crop((x, y, x+w, y+h))
-            futures.append(ex.submit(_ocr_pil, crop, True))
+        # banda inferior "digits-only"
+        futures.append(ex.submit(_ocr_pil, band_pre, True))
+
         for f in as_completed(futures):
             txt = f.result()
             if txt and len(txt.strip()) > 3:
@@ -247,28 +205,22 @@ def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
     return "\n".join(clean)
 
 def _make_debug_variants(base_img: Image.Image, thr_ui=160, inv=True):
-    """Genera variantes preprocesadas y cajas detectadas p/diagnóstico."""
-    thumbs = []  # (titulo, np.array RGB)
-    # Globales
+    """Genera variantes para diagnóstico (sin OpenCV)."""
+    thumbs = []  # (title, PIL.Image)
     for label_invert, invert in (("normal", False), ("invertida", True) if inv else ("normal", False),):
         for delta in (-20, 0, 20):
             thr = max(50, min(220, thr_ui + delta))
-            pre = _preprocess_for_ocr(base_img, scale=2.3, invert=invert, thr=thr)
-            thumbs.append((f"Global {label_invert} thr={thr}", np.array(pre.convert("RGB"))))
+            pre = _preprocess_for_ocr_purepil(base_img, scale=2.3, invert=invert, thr=thr)
+            thumbs.append((f"Global {label_invert} thr={thr}", pre))
     # Banda inferior
     W, H = base_img.size
     y0 = int(H*0.58)
     band = base_img.crop((0, y0, W, H))
-    band_pre = _preprocess_for_ocr(band, scale=3.0, invert=False, thr=thr_ui)
-    band_np = np.array(band_pre.convert("L"))
-    boxes = _detect_text_regions(band_np)
-    dbg = np.dstack([band_np]*3)
-    for (x,y,w,h) in boxes[:20]:
-        cv2.rectangle(dbg, (x,y), (x+w,y+h), (0,255,0), 2)
-    thumbs.append((f"Banda inferior + cajas ({len(boxes)} det.)", dbg))
-    return thumbs, boxes
+    band_pre = _preprocess_for_ocr_purepil(band, scale=3.0, invert=False, thr=thr_ui)
+    thumbs.append((f"Banda inferior (preprocesada)", band_pre))
+    return thumbs
 
-# =============== Parseo CRONOTrigo desde OCR ===============
+# ================== Parseo CRONOTrigo ==================
 def parse_cronotrigo_text(txt: str):
     T = re.sub(r"[ \t]+", " ", txt)
     T = re.sub(r"[–—]+", "-", T)
@@ -341,7 +293,7 @@ def parse_cronotrigo_text(txt: str):
     meta = {"AguaSuelo_frac": agua_frac, "TT_aprox": tt_val}
     return estados, ventanas, key_dates, meta, T
 
-# =============== PREDWEEM (carga/correr) ===============
+# ================== PREDWEEM ==================
 THR_BAJO_MEDIO = 0.020
 THR_MEDIO_ALTO = 0.079
 EMEAC_MIN_DEN, EMEAC_ADJ_DEN, EMEAC_MAX_DEN = 1.8, 2.1, 2.5
@@ -449,7 +401,7 @@ def run_predweem_from_file(pred_file):
         out["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
     return out.reset_index(drop=True)
 
-# =============== MeteoBahía (opcional) ===============
+# ================== MeteoBahía (opcional) ==================
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_meteobahia_xml(url: str) -> str:
     from urllib.request import urlopen, Request
@@ -486,7 +438,7 @@ def parse_meteobahia_xml(xml_text: str) -> pd.DataFrame:
     df = _sanitize_meteo(df[["Fecha","Julian_days","TMAX","TMIN","Prec"]])
     return df
 
-# =============== Sidebar (entradas + OCR avanzado) ===============
+# ================== Sidebar ==================
 with st.sidebar:
     st.header("Entradas")
     file_img = st.file_uploader("Imagen CRONOTrigo (PNG/JPG)", type=["png","jpg","jpeg"])
@@ -502,7 +454,7 @@ with st.sidebar:
     elif modo_pred == "API MeteoBahía (XML)":
         meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml")
 
-# =============== PROCESO: Imagen -> OCR -> Parseo (con mensajes y diagnóstico) ===============
+# ================== Imagen -> OCR -> Parseo ==================
 estados = ventanas = key_dates = meta = None
 ocr_txt = ""
 colL, colR = st.columns([1,2], vertical_alignment="top")
@@ -526,29 +478,26 @@ with colL:
             ocr_txt = ocr_text_from_image(raw, inv=inv, thr_ui=thr_ui)
 
         if not ocr_txt or len(ocr_txt.strip()) < 15:
-            # Mensaje claro + diagnóstico
             st.error("No se pudo leer texto de la imagen.")
             st.info(
                 f"Archivo: **{file_img.name}** · Resolución: **{w}x{h}px** · Tamaño: **{size_kb}** · EXIF: **{orient}**\n\n"
-                "- Probá subir una captura con mayor resolución (≥ 1200 px de ancho).\n"
-                "- Ajustá *Umbral de binarización* (sidebar) ±20–40.\n"
-                "- Activá/Desactivá **Probar inversión**.\n"
-                "- Evitá recortes que dejen fuera títulos/fechas."
+                "- Probá mayor resolución (≥ 1200 px de ancho).\n"
+                "- Ajustá *Umbral* ±20–40.\n"
+                "- Activá/Desactivá **Probar inversión**."
             )
             st.markdown("### Diagnóstico OCR")
-            thumbs, boxes = _make_debug_variants(base_img, thr_ui=thr_ui, inv=inv)
+            thumbs = _make_debug_variants(base_img, thr_ui=thr_ui, inv=inv)
             c1, c2 = st.columns(2)
-            for i, (title, arr) in enumerate(thumbs):
-                (c1 if i % 2 == 0 else c2).image(arr, caption=title, use_container_width=True)
+            for i, (title, pilim) in enumerate(thumbs):
+                (c1 if i % 2 == 0 else c2).image(pilim, caption=title, use_container_width=True)
 
             # ZIP diagnóstico
             with io.BytesIO() as mem:
                 with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("README.txt", "Variantes de preprocesado para diagnóstico OCR.\n"
-                                              "Probá ajustar el umbral y la inversión en la app.\n")
-                    for i, (title, arr) in enumerate(thumbs):
-                        ok = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))[1]
-                        zf.writestr(f"variant_{i:02d}.png", ok.tobytes())
+                    zf.writestr("README.txt", "Variantes de preprocesado (sin OpenCV) para diagnóstico OCR.\n")
+                    for i, (title, pilim) in enumerate(thumbs):
+                        buf = io.BytesIO(); pilim.save(buf, format="PNG"); buf.seek(0)
+                        zf.writestr(f"variant_{i:02d}.png", buf.read())
                 mem.seek(0)
                 st.download_button("⬇ Descargar variantes (ZIP diagnóstico)", data=mem.read(),
                                    file_name="ocr_diagnostico_variantes.zip", mime="application/zip")
@@ -575,7 +524,7 @@ with colR:
             st.error(f"No se pudo interpretar la imagen: {e}")
             estados = ventanas = key_dates = None
 
-# =============== PREDWEEM: cargar/correr ===============
+# ================== PREDWEEM ==================
 st.subheader("Serie PREDWEEM")
 pred_vis = None
 try:
@@ -598,7 +547,7 @@ try:
 except Exception as e:
     st.error(f"No se pudo generar la serie de PREDWEEM: {e}")
 
-# =============== Colores y utilidades de gráficos ===============
+# ================== Gráficos ==================
 def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=("Alto","#d62728")):
     mp = {pal[0]: pal[1], pb[0]: pb[1], pa[0]: pa[1]}
     return serie.map(mp).fillna("#808080").to_numpy()
@@ -642,7 +591,6 @@ def rgba(hex_color, alpha=0.15):
     r = int(hex_color[0:2],16); g = int(hex_color[2:4],16); b = int(hex_color[4:6],16)
     return f"rgba({r},{g},{b},{alpha})"
 
-# =============== Gráficos + integración ===============
 fig_er = fig_ac = fig_tl = None
 if pred_vis is not None and len(pred_vis):
     pred_plot = pred_vis.copy()
@@ -713,7 +661,7 @@ if estados is not None:
     fig_tl.update_layout(xaxis_title="Fecha", hovermode="x unified", height=300)
     st.plotly_chart(fig_tl, use_container_width=True, theme="streamlit")
 
-# =============== Descargas individuales ===============
+# ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
 if estados is not None:
@@ -729,7 +677,6 @@ if 'pred_vis' in locals() and pred_vis is not None:
     buf3 = io.StringIO(); pred_vis.to_csv(buf3, index=False)
     cols[2].download_button("⬇ Serie PREDWEEM (CSV)", data=buf3.getvalue(), file_name="predweem_serie.csv", mime="text/csv")
 
-# =============== Descargar TODO (ZIP con CSV + HTML) ===============
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
@@ -746,6 +693,7 @@ if zip_ready:
                 v_out.to_csv(_b, index=False); zf.writestr("cronotrigo_periodo_critico.csv", _b.getvalue())
             if 'pred_vis' in locals() and pred_vis is not None:
                 _b = io.StringIO(); pred_vis.to_csv(_b, index=False); zf.writestr("predweem_serie.csv", _b.getvalue())
+            # gráficos
             if 'fig_er' in locals() and fig_er is not None: zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
             if 'fig_ac' in locals() and fig_ac is not None: zf.writestr("grafico_emeac.html", fig_to_html_bytes(fig_ac))
             if 'fig_tl' in locals() and fig_tl is not None: zf.writestr("timeline_cronotrigo.html", fig_to_html_bytes(fig_tl))
