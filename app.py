@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_plus_ocrpatch.py
+# app_cronotrigo_predweem_ocr_optimized.py
+# CRONOTrigo + PREDWEEM con OCR optimizado (rápido y robusto)
 
-import io, re, zipfile
+import io, re, zipfile, hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 import streamlit as st
 import plotly.graph_objects as go
+import cv2
 
 # =============== UI/LOCKDOWN ===============
-st.set_page_config(page_title="CRONOTrigo + PREDWEEM (Imagen + OCR)", layout="wide")
+st.set_page_config(page_title="CRONOTrigo + PREDWEEM (OCR optimizado)", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -18,8 +21,7 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-
-st.title("CRONOTrigo + PREDWEEM · Integración desde imagen (OCR robusto)")
+st.title("CRONOTrigo + PREDWEEM · OCR optimizado (rápido y robusto)")
 
 # =============== Helpers genéricos ===============
 def _norm_col(df, aliases):
@@ -74,66 +76,156 @@ def _get_rapidocr():
         return None
 
 def _preprocess_for_ocr(img: Image.Image, scale=2.5, invert=False, thr=None) -> Image.Image:
+    """Pipeline robusto: resize -> CLAHE -> deskew -> binarización + morfología."""
+    # Resize
     w, h = img.size
     img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-    img2 = ImageOps.grayscale(img2)
-    img2 = ImageEnhance.Contrast(img2).enhance(1.6)
-    img2 = ImageEnhance.Sharpness(img2).enhance(1.4)
+
+    # A OpenCV
+    arr = np.array(img2.convert("RGB"))
+    g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    # CLAHE (mejora contraste local para texto tenue)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(g)
+
+    # Deskew aproximado: detectar ángulo dominante
+    edges = cv2.Canny(g, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=150)
+    angle = 0.0
+    if lines is not None and len(lines) > 5:
+        angles = [(theta - np.pi/2) for rho, theta in lines[:,0,:]]
+        angle = (np.mean(angles) * 180/np.pi)
+        angle = float(np.clip(angle, -5.0, 5.0))
+    if abs(angle) > 0.3:
+        M = cv2.getRotationMatrix2D((g.shape[1]//2, g.shape[0]//2), angle, 1.0)
+        g = cv2.warpAffine(g, M, (g.shape[1], g.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    # Binarización
     if thr is None:
-        arr = np.asarray(img2).astype(np.uint8)
-        t = int(np.percentile(arr, 60))
+        th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 35, 11)
     else:
-        t = thr
-    img2 = img2.point(lambda x: 255 if x > t else 0)
+        _, th = cv2.threshold(g, thr, 255, cv2.THRESH_BINARY)
+
     if invert:
-        img2 = ImageOps.invert(img2)
-    return img2
+        th = cv2.bitwise_not(th)
 
-def _ocr_rapid(img: Image.Image) -> str:
-    try:
-        ocr = _get_rapidocr()
-        if not ocr: return ""
-        res, _ = ocr(img)
-        if not res: return ""
-        lines = [r[1] for r in res if isinstance(r, (list, tuple)) and len(r) >= 2]
-        return "\n".join(lines)
-    except Exception:
-        return ""
+    # Morfología ligera para unir caracteres
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
 
-def _ocr_tesseract(img: Image.Image, cfg="") -> str:
-    try:
-        import pytesseract
-        return pytesseract.image_to_string(img, lang="spa", config=cfg)
-    except Exception:
-        return ""
+    return Image.fromarray(th)
 
+def _img_sha1(img_bytes: bytes) -> str:
+    return hashlib.sha1(img_bytes).hexdigest()
+
+def _detect_text_regions(bin_img: np.ndarray):
+    """Detecta cajas con texto en una imagen binarizada (np.uint8 0/255). Devuelve (x,y,w,h)."""
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15,3))
+    closed = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, k, iterations=1)
+    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    H, W = bin_img.shape[:2]
+    for c in cnts:
+        x,y,w,h = cv2.boundingRect(c)
+        if w*h < 500: 
+            continue
+        if w < 30 or h < 12:
+            continue
+        if (w/h) < 1.5 and h < 20:
+            continue
+        x0 = max(0, x-4); y0 = max(0, y-4)
+        x1 = min(W, x+w+4); y1 = min(H, y+h+4)
+        boxes.append((x0,y0,x1-x0,y1-y0))
+    boxes.sort(key=lambda b: (b[1], b[0]))
+    return boxes
+
+def _tile_generator(img: Image.Image, tile=900, overlap=160):
+    """Divide imagen en tiles con solapamiento para capturar texto pequeño sin overkill."""
+    W, H = img.size
+    xs = list(range(0, max(1, W - tile) + 1, max(1, tile - overlap)))
+    ys = list(range(0, max(1, H - tile) + 1, max(1, tile - overlap)))
+    for y in ys:
+        for x in xs:
+            yield (x, y, img.crop((x, y, min(x+tile, W), min(y+tile, H))))
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
+    """
+    OCR optimizado:
+    - Preprocesado con CLAHE + deskew
+    - Detección de regiones de texto + OCR por caja
+    - Tiling con solapamiento (paralelizado)
+    - Banda de 'tarjetas' inferior con OCR restringido a dígitos/fechas
+    """
+    _ = _img_sha1(img_bytes) + f"|inv={int(bool(inv))}|thr={thr_ui}"
     base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     texts = []
 
-    # PASO 1: OCR global con variantes
+    # 1) OCR global con variantes
+    variants = []
     for invert in ([False, True] if inv else [False]):
         for thr in (thr_ui-20, thr_ui, thr_ui+20):
-            pre = _preprocess_for_ocr(base, scale=2.7, invert=invert, thr=max(50, min(220, thr)))
-            txt = _ocr_rapid(pre) or _ocr_tesseract(pre, cfg="--oem 3 --psm 6")
-            if txt and len(txt.strip()) > 15:
+            pre = _preprocess_for_ocr(base, scale=2.3, invert=invert, thr=max(50, min(220, thr)))
+            variants.append(pre)
+
+    # 2) Banda inferior (tarjetas)
+    W, H = base.size
+    y0 = int(H*0.58)
+    band = base.crop((0, y0, W, H))
+    band_pre = _preprocess_for_ocr(band, scale=3.0, invert=False, thr=thr_ui)
+    band_np = np.array(band_pre.convert("L"))
+    band_boxes = _detect_text_regions(band_np)
+
+    # 3) Tiles con solapamiento
+    tiles = list(_tile_generator(base, tile=900, overlap=160))
+
+    # 4) Ejecutar OCR en paralelo
+    ocr = _get_rapidocr()
+    def _ocr_pil(pil_im: Image.Image, digits_only=False) -> str:
+        if ocr is not None:
+            try:
+                res, _ = ocr(pil_im)
+                if res:
+                    return "\n".join([r[1] for r in res if isinstance(r,(list,tuple)) and len(r)>=2])
+            except Exception:
+                pass
+        try:
+            import pytesseract
+            cfg = "--oem 3 --psm 6"
+            if digits_only:
+                cfg += " -c tessedit_char_whitelist=0123456789/%-+ "
+            return pytesseract.image_to_string(pil_im, lang="spa", config=cfg)
+        except Exception:
+            return ""
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for pre in variants:
+            futures.append(ex.submit(_ocr_pil, pre, False))
+        for x, y, tile in tiles:
+            pre_tile = _preprocess_for_ocr(tile, scale=2.0, invert=False, thr=thr_ui)
+            futures.append(ex.submit(_ocr_pil, pre_tile, False))
+        for (x,y,w,h) in band_boxes[:20]:
+            crop = band_pre.crop((x, y, x+w, y+h))
+            futures.append(ex.submit(_ocr_pil, crop, True))
+        for f in as_completed(futures):
+            txt = f.result()
+            if txt and len(txt.strip()) > 3:
                 texts.append(txt)
 
-    # PASO 2: OCR por regiones (franja inferior de tarjetas)
-    w, h = base.size
-    y0 = int(h*0.60)
-    cards = base.crop((0, y0, w, h))
-    ncols = 6
-    col_w = cards.width // ncols
-    cfg_digits = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789/ -c preserve_interword_spaces=1'
-    for i in range(ncols):
-        crop = cards.crop((i*col_w, 0, (i+1)*col_w, cards.height))
-        pre = _preprocess_for_ocr(crop, scale=3.0, invert=False, thr=thr_ui)
-        txt = _ocr_rapid(pre) or _ocr_tesseract(pre, cfg=cfg_digits)
-        if txt and len(txt.strip()) > 3:
-            texts.append(txt)
-
-    return "\n".join(texts)
+    joined = "\n".join(texts)
+    joined = re.sub(r"[ \t]+", " ", joined)
+    lines = [l.strip() for l in joined.splitlines() if l.strip()]
+    seen = set(); clean = []
+    for l in lines:
+        k = l.lower()
+        if k in seen: 
+            continue
+        seen.add(k)
+        clean.append(l)
+    return "\n".join(clean)
 
 # =============== Parseo CRONOTrigo desde OCR ===============
 def parse_cronotrigo_text(txt: str):
@@ -158,7 +250,6 @@ def parse_cronotrigo_text(txt: str):
             if ln: hit_kw = kw; break
         if ln:
             dt, unc = _to_datetime_safe(ln)
-            # segunda pasada: buscar fecha inmediatamente posterior al keyword si no se detectó
             if pd.isna(dt) and hit_kw:
                 patt = re.compile(rf"{hit_kw}.*?\n([0-9]{{1,2}}[/-][0-9]{{1,2}}(?:[/-][0-9]{{2,4}})?(?:\s*[±\+/-]\s*\d+)?)",
                                   re.IGNORECASE|re.DOTALL)
@@ -170,7 +261,6 @@ def parse_cronotrigo_text(txt: str):
 
     default_year = max(years_seen) if years_seen else pd.Timestamp.now().year
 
-    # Período crítico
     ln_pc = _find_line(T, "período crítico") or _find_line(T, "periodo critico")
     pc_ini, pc_fin = pd.NaT, pd.NaT
     if ln_pc:
@@ -187,7 +277,6 @@ def parse_cronotrigo_text(txt: str):
         if ln_ini: pc_ini, _ = _to_datetime_safe(ln_ini, default_year)
         if ln_fin: pc_fin, _ = _to_datetime_safe(ln_fin, default_year)
 
-    # Agua/TT (si aparecen)
     ln_sw = _find_line(T, "agua", "suelo") or _find_line(T, "suelo", "agua")
     agua_frac = _num(ln_sw, pct=True) if ln_sw else float("nan")
     ln_tt = _find_line(T, "tt") or _find_line(T, "térmico") or _find_line(T, "termico")
@@ -268,14 +357,12 @@ class PracticalANNModel:
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
-
     def _tansig(self, x): return np.tanh(x)
     def _norm(self, X):
         Xc = np.clip(X, self.input_min, self.input_max)
         return 2 * (Xc - self.input_min) / self._den - 1
     def _denorm_out(self, y, ymin=-1, ymax=1):
         return (y - ymin) / (ymax - ymin)
-
     def predict(self, X_real):
         Xn = self._norm(X_real)
         z1 = Xn @ self.IW + self.b1
@@ -388,6 +475,7 @@ with colL:
             ocr_txt = ocr_text_from_image(img_bytes, inv=inv, thr_ui=thr_ui)
         if not ocr_txt:
             st.error("No se pudo leer texto de la imagen. Probá otra captura o ajustá el umbral.")
+            st.info("Si estás local: `pip install rapidocr-onnxruntime`. Fallback Tesseract requiere el binario del SO.")
     else:
         st.info("Subí una imagen para continuar.")
 
@@ -527,7 +615,7 @@ if pred_vis is not None and len(pred_vis):
 
     if key_dates is not None:
         st.subheader("Métricas integradas (CRONOTrigo + PREDWEEM)")
-        resumen = integrar_metricas(pred_plot, key_dates, ventanas)
+        resumen = integrar_metricas(pred_plot, key_dates, ventanas).fillna(0.0)
         st.dataframe(resumen.style.format({c:"{:.0%}" for c in resumen.columns}), use_container_width=True)
 
 if estados is not None:
@@ -585,4 +673,3 @@ if zip_ready:
             if 'fig_tl' in locals() and fig_tl is not None: zf.writestr("timeline_cronotrigo.html", fig_to_html_bytes(fig_tl))
         mem.seek(0)
         st.download_button("⬇ Descargar TODO (ZIP)", data=mem.read(), file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
-
