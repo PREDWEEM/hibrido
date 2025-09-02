@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_no_cv2_fixed.py
-# CRONOTrigo + PREDWEEM con OCR optimizado (sin OpenCV) + fix UnsharpMask
+# app_cronotrigo_predweem_web.py
+# CRONOTrigo + PREDWEEM integrado por WEB (sin OCR/imagenes)
+# - Modo Iframe (embed)
+# - Modo Extraer tabla (requests + BeautifulSoup)
+# - Modo HTML subido (lee tu .html guardado)
+# Tabla de riesgos identificada como id="table-riesgos" en el HTML oficial.
 
-import io, re, zipfile, hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import io, re, zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import streamlit as st
 import plotly.graph_objects as go
 
+# ======= NEW: web components + scraping =======
+import streamlit.components.v1 as components
+import requests
+from bs4 import BeautifulSoup
+
 # ================== UI ==================
-st.set_page_config(page_title="CRONOTrigo + PREDWEEM (OCR sin OpenCV)", layout="wide")
+st.set_page_config(page_title="CRONOTrigo + PREDWEEM (Web)", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -21,7 +28,7 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTrigo + PREDWEEM · OCR (sin OpenCV)")
+st.title("CRONOTrigo + PREDWEEM · Integración Web (sin OCR)")
 
 # ================== Utils ==================
 def _norm_col(df, aliases):
@@ -29,283 +36,63 @@ def _norm_col(df, aliases):
         if a in df.columns: return a
     return None
 
-DATE_PAT = re.compile(
-    r"(?P<d>\d{1,2})[/-](?P<m>\d{1,2})(?:[/-](?P<y>\d{2,4}))?(?:\s*[±\+/-]\s*(?P<u>\d+))?",
-    re.UNICODE
-)
-NUM_PAT = re.compile(r"(-?\d+(?:[.,]\d+)?)")
-
-def _to_datetime_safe(s, default_year=None):
-    if s is None: return (pd.NaT, float("nan"))
-    s = str(s).strip()
-    m = DATE_PAT.search(s)
-    if not m:
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        return (dt, float("nan"))
-    d, mth, y = int(m.group("d")), int(m.group("m")), m.group("y")
-    if y is None:
-        y = default_year if default_year else pd.Timestamp.now().year
-    y = int(y) if len(str(y)) == 4 else 2000 + int(y)
-    unc = float(m.group("u")) if m.group("u") else float("nan")
-    try:
-        return (pd.Timestamp(year=y, month=mth, day=d), unc)
-    except Exception:
-        return (pd.NaT, unc)
-
 def _num(s, pct=False):
     if s is None: return float("nan")
-    m = NUM_PAT.search(str(s).replace(",", "."))
+    m = re.search(r"(-?\d+(?:[.,]\d+)?)", str(s).replace(",", "."))
     if not m: return float("nan")
     v = float(m.group(1))
     return v/100.0 if pct and v > 1 else v
 
-def _find_line(block, *needles):
-    for ln in block.splitlines():
-        L = ln.lower()
-        if all(n.lower() in L for n in needles):
-            return ln.strip()
-    return ""
+def rgba(hex_color, alpha=0.15):
+    hex_color = hex_color.lstrip("#")
+    r = int(hex_color[0:2],16); g = int(hex_color[2:4],16); b = int(hex_color[4:6],16)
+    return f"rgba({r},{g},{b},{alpha})"
 
-def _human_kb(n):
-    try: return f"{n/1024:.1f} KB"
-    except: return "—"
+# ================== CRONOTRIGO (WEB) ==================
+CRONOTRIGO_URL = "https://cronotrigo.agro.uba.ar/index.php/cronos/AR"
 
-def _exif_orientation(img: Image.Image) -> str:
-    try:
-        exif = img.getexif() or {}
-        from PIL import ExifTags
-        for k, v in exif.items():
-            tag = ExifTags.TAGS.get(k, k)
-            if tag == "Orientation":
-                return {1:"Normal",3:"Rotada 180°",6:"90° CW",8:"90° CCW"}.get(v, str(v))
-    except Exception:
-        pass
-    return "No disponible"
-
-# ================== OCR ==================
-@st.cache_resource(show_spinner=False)
-def _get_rapidocr():
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        return RapidOCR()
-    except Exception:
+def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
+    """Devuelve la tabla de riesgos como DataFrame (id='table-riesgos') o None si no se encuentra."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    table = soup.find("table", {"id": "table-riesgos"})  # presente en el HTML oficial:contentReference[oaicite:1]{index=1}
+    if not table:
         return None
 
-if _get_rapidocr() is None:
-    st.warning("No se pudo inicializar RapidOCR. Intentaré fallback con Tesseract si está disponible. "
-               "Sugerencia: `pip install rapidocr-onnxruntime`.")
-
-def _preprocess_for_ocr_purepil(img: Image.Image, scale=2.5, invert=False, thr=None) -> Image.Image:
-    """
-    Preprocesado sin OpenCV:
-    - Resize (LANCZOS)
-    - Autocontrast + incremento de contraste
-    - Nitidez con UnsharpMask (o Sharpness si hay error)
-    - Binarización simple por percentil/umbral
-    - Inversión opcional
-    """
-    # Resize
-    w, h = img.size
-    img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-
-    # Escala de grises + ajuste de contraste
-    g = ImageOps.grayscale(img2)
-    g = ImageOps.autocontrast(g)
-    g = ImageEnhance.Contrast(g).enhance(1.5)
-
-    # Nitidez correcta (image.filter(...))
-    try:
-        g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=2))
-    except Exception:
-        g = ImageEnhance.Sharpness(g).enhance(1.4)
-
-    # Binarización
-    import numpy as _np
-    arr = _np.asarray(g).astype(_np.uint8)
-    if thr is None:
-        t = int(_np.percentile(arr, 60))
-    else:
-        t = int(thr)
-    bin_arr = (arr > t).astype(_np.uint8) * 255
-    out = Image.fromarray(bin_arr, mode="L")
-
-    # Inversión opcional
-    if invert:
-        out = ImageOps.invert(out)
-
-    return out.convert("RGB")
-
-def _img_sha1(img_bytes: bytes) -> str:
-    return hashlib.sha1(img_bytes).hexdigest()
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
-    """
-    OCR optimizado (sin OpenCV):
-    - Variantes globales (umbral +/-)
-    - Tiling con solape
-    - Banda inferior (tarjetas) con OCR focalizado (digits_only)
-    """
-    _ = _img_sha1(img_bytes) + f"|inv={int(bool(inv))}|thr={thr_ui}"
-    base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    texts = []
-
-    def _ocr_pil(pil_im: Image.Image, digits_only=False) -> str:
-        ocr = _get_rapidocr()
-        if ocr is not None:
-            try:
-                res, _ = ocr(pil_im)
-                if res:
-                    return "\n".join([r[1] for r in res if isinstance(r,(list,tuple)) and len(r)>=2])
-            except Exception:
-                pass
-        try:
-            import pytesseract
-            cfg = "--oem 3 --psm 6"
-            if digits_only:
-                cfg += " -c tessedit_char_whitelist=0123456789/%-+ "
-            return pytesseract.image_to_string(pil_im, lang="spa", config=cfg)
-        except Exception:
-            return ""
-
-    # 1) Variantes globales
-    variants = []
-    for invert in ([False, True] if inv else [False]):
-        for thr in (thr_ui-20, thr_ui, thr_ui+20):
-            variants.append(_preprocess_for_ocr_purepil(base, scale=2.3, invert=invert, thr=max(50, min(220, thr))))
-
-    # 2) Banda inferior (tarjetas)
-    W, H = base.size
-    y0 = int(H*0.58)
-    band = base.crop((0, y0, W, H))
-    band_pre = _preprocess_for_ocr_purepil(band, scale=3.0, invert=False, thr=thr_ui)
-
-    # 3) Tiles con solape
-    def _tiles(img: Image.Image, tile=900, overlap=160):
-        W, H = img.size
-        step = max(1, tile - overlap)
-        xs = list(range(0, max(1, W - tile) + 1, step))
-        ys = list(range(0, max(1, H - tile) + 1, step))
-        for y in ys:
-            for x in xs:
-                yield img.crop((x, y, min(x+tile, W), min(y+tile, H)))
-
-    # 4) Paralelizar OCR
-    futures = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for pre in variants:
-            futures.append(ex.submit(_ocr_pil, pre, False))
-        for tile in _tiles(base, tile=900, overlap=160):
-            pre_tile = _preprocess_for_ocr_purepil(tile, scale=2.0, invert=False, thr=thr_ui)
-            futures.append(ex.submit(_ocr_pil, pre_tile, False))
-        # banda inferior "digits-only"
-        futures.append(ex.submit(_ocr_pil, band_pre, True))
-
-        for f in as_completed(futures):
-            txt = f.result()
-            if txt and len(txt.strip()) > 3:
-                texts.append(txt)
-
-    joined = "\n".join(texts)
-    joined = re.sub(r"[ \t]+", " ", joined)
-    lines = [l.strip() for l in joined.splitlines() if l.strip()]
-    seen = set(); clean = []
-    for l in lines:
-        k = l.lower()
-        if k in seen: 
+    # headers
+    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    # rows
+    rows = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
-        seen.add(k)
-        clean.append(l)
-    return "\n".join(clean)
+        rows.append([td.get_text(strip=True) for td in tds])
 
-def _make_debug_variants(base_img: Image.Image, thr_ui=160, inv=True):
-    """Genera variantes para diagnóstico (sin OpenCV)."""
-    thumbs = []  # (title, PIL.Image)
-    for label_invert, invert in (("normal", False), ("invertida", True) if inv else ("normal", False),):
-        for delta in (-20, 0, 20):
-            thr = max(50, min(220, thr_ui + delta))
-            pre = _preprocess_for_ocr_purepil(base_img, scale=2.3, invert=invert, thr=thr)
-            thumbs.append((f"Global {label_invert} thr={thr}", pre))
-    # Banda inferior
-    W, H = base_img.size
-    y0 = int(H*0.58)
-    band = base_img.crop((0, y0, W, H))
-    band_pre = _preprocess_for_ocr_purepil(band, scale=3.0, invert=False, thr=thr_ui)
-    thumbs.append((f"Banda inferior (preprocesada)", band_pre))
-    return thumbs
+    if not rows:
+        return None
 
-# ================== Parseo CRONOTrigo ==================
-def parse_cronotrigo_text(txt: str):
-    T = re.sub(r"[ \t]+", " ", txt)
-    T = re.sub(r"[–—]+", "-", T)
-
-    labels = {
-        "Siembra":      ["siembra"],
-        "Emergencia":   ["emergencia"],
-        "Primer_nudo":  ["primer nudo", "z31", "nudo visible", "encañazón", "primer-nudo"],
-        "Espigazon":    ["espig", "espigazón", "espiga"],
-        "Antesis":      ["antesis", "floración", "floracion"],
-        "Madurez":      ["madurez", "madurez fisiologica", "madurez fisiológica"],
-    }
-
-    filas, years_seen = [], []
-    for k, keys in labels.items():
-        ln = ""
-        hit_kw = None
-        for kw in keys:
-            ln = _find_line(T, kw)
-            if ln: hit_kw = kw; break
-        if ln:
-            dt, unc = _to_datetime_safe(ln)
-            if pd.isna(dt) and hit_kw:
-                patt = re.compile(rf"{hit_kw}.*?\n([0-9]{{1,2}}[/-][0-9]{{1,2}}(?:[/-][0-9]{{2,4}})?(?:\s*[±\+/-]\s*\d+)?)",
-                                  re.IGNORECASE|re.DOTALL)
-                m2 = patt.search(T)
-                if m2:
-                    dt, unc = _to_datetime_safe(m2.group(1))
-            if pd.notna(dt): years_seen.append(dt.year)
-            filas.append({"Estadio": k, "Fecha": dt, "±d": unc})
-
-    default_year = max(years_seen) if years_seen else pd.Timestamp.now().year
-
-    ln_pc = _find_line(T, "período crítico") or _find_line(T, "periodo critico")
-    pc_ini, pc_fin = pd.NaT, pd.NaT
-    if ln_pc:
-        matches = DATE_PAT.findall(ln_pc)
-        if len(matches) >= 2:
-            def make_date(m):
-                dd, mm, yy, uu = m
-                frag = f"{dd}/{mm}" + (f"/{yy}" if yy else "")
-                return _to_datetime_safe(frag, default_year)[0]
-            pc_ini = make_date(matches[0]); pc_fin = make_date(matches[1])
+    max_len = max(len(r) for r in rows)
+    rows = [r + [""] * (max_len - len(r)) for r in rows]
+    if not headers:
+        headers = [f"Columna {i+1}" for i in range(max_len)]
     else:
-        ln_ini = _find_line(T, "inicio", "crítico") or _find_line(T, "inicio", "critico")
-        ln_fin = _find_line(T, "fin", "crítico") or _find_line(T, "fin", "critico")
-        if ln_ini: pc_ini, _ = _to_datetime_safe(ln_ini, default_year)
-        if ln_fin: pc_fin, _ = _to_datetime_safe(ln_fin, default_year)
+        headers = headers[:max_len] + [f"Columna {i+1}" for i in range(len(headers), max_len)]
 
-    ln_sw = _find_line(T, "agua", "suelo") or _find_line(T, "suelo", "agua")
-    agua_frac = _num(ln_sw, pct=True) if ln_sw else float("nan")
-    ln_tt = _find_line(T, "tt") or _find_line(T, "térmico") or _find_line(T, "termico")
-    tt_val = _num(ln_tt) if ln_tt else float("nan")
+    df = pd.DataFrame(rows, columns=headers)
+    return df
 
-    estados = pd.DataFrame(filas)
-    if estados.empty:
-        raise ValueError("No se reconocieron estadios en la imagen.")
-
-    for n in ["Siembra","Emergencia","Primer_nudo","Espigazon","Antesis","Madurez"]:
-        if not (estados["Estadio"] == n).any():
-            estados.loc[len(estados)] = {"Estadio": n, "Fecha": pd.NaT, "±d": float("nan")}
-    estados = estados.sort_values("Fecha").reset_index(drop=True)
-
-    key_dates = {r["Estadio"]: r["Fecha"] for _, r in estados.iterrows()}
-    ventanas = pd.DataFrame({
-        "Ventana": ["Período crítico"],
-        "Inicio": [pc_ini], "Fin": [pc_fin],
-        "Duración (d)": [(pc_fin - pc_ini).days if (pd.notna(pc_ini) and pd.notna(pc_fin)) else float("nan")]
-    })
-    meta = {"AguaSuelo_frac": agua_frac, "TT_aprox": tt_val}
-    return estados, ventanas, key_dates, meta, T
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_cronotrigo_html() -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    resp = requests.get(CRONOTRIGO_URL, headers=headers, timeout=20)
+    resp.raise_for_status()
+    return resp.text
 
 # ================== PREDWEEM ==================
 THR_BAJO_MEDIO = 0.020
@@ -454,89 +241,66 @@ def parse_meteobahia_xml(xml_text: str) -> pd.DataFrame:
 
 # ================== Sidebar ==================
 with st.sidebar:
-    st.header("Entradas")
-    file_img = st.file_uploader("Imagen CRONOTrigo (PNG/JPG)", type=["png","jpg","jpeg"])
-    with st.expander("⚙️ OCR avanzado", expanded=False):
-        inv = st.checkbox("Probar inversión", True)
-        thr_ui = st.slider("Umbral binarización", 80, 200, 160, 5)
+    st.header("CRONOTRIGO (Web)")
+    modo_crono = st.radio(
+        "Elegí el modo de integración",
+        ["Iframe (recomendado)", "Extraer tabla (vivo)", "Usar HTML subido"],
+        index=0
+    )
+
+    cronot_html_file = None
+    if modo_crono == "Usar HTML subido":
+        cronot_html_file = st.file_uploader(
+            "Subí el HTML exportado de Cronotrigo",
+            type=["html","htm"],
+            key="cronot_html"
+        )
+
     st.markdown("---")
-    st.markdown("**PREDWEEM**")
-    modo_pred = st.radio("Modo", ["Subir archivo (EMERREL/EMERAC)", "CSV público", "API MeteoBahía (XML)"], index=0)
+    st.header("PREDWEEM")
+    modo_pred = st.radio("Origen de datos", ["Subir archivo (EMERREL/EMERAC)", "CSV público", "API MeteoBahía (XML)"], index=0)
     pred_file = None; meteo_url = None
     if modo_pred == "Subir archivo (EMERREL/EMERAC)":
         pred_file = st.file_uploader("CSV/XLSX diario", type=["csv","xlsx"], key="pred_up")
     elif modo_pred == "API MeteoBahía (XML)":
         meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml")
 
-# ================== Imagen -> OCR -> Parseo ==================
-estados = ventanas = key_dates = meta = None
-ocr_txt = ""
-colL, colR = st.columns([1,2], vertical_alignment="top")
+# ================== CRONOTRIGO: Visualización / Datos ==================
+st.subheader("CRONOTRIGO – Resultados FAUBA")
 
-with colL:
-    st.subheader("Imagen CRONOTrigo")
-    if file_img:
-        raw = file_img.read()
-        size_kb = _human_kb(len(raw))
+cronot_df = None  # DataFrame con tabla de riesgos si se pudo extraer
+if modo_crono == "Iframe (recomendado)":
+    components.iframe(CRONOTRIGO_URL, height=900, scrolling=True)
+    st.caption("Si el sitio bloquea iframes, usá ‘Extraer tabla (vivo)’ o ‘Usar HTML subido’.")
+    st.link_button("Abrir Cronotrigo en pestaña nueva", CRONOTRIGO_URL)
+
+elif modo_crono == "Extraer tabla (vivo)":
+    with st.spinner("Consultando Cronotrigo…"):
         try:
-            base_img = Image.open(io.BytesIO(raw)).convert("RGB")
+            html_text = fetch_cronotrigo_html()
+            cronot_df = _scrape_cronotrigo_table(html_text)
+            if cronot_df is not None:
+                st.success("Tabla de riesgos extraída correctamente.")
+                st.dataframe(cronot_df, use_container_width=True)
+            else:
+                st.warning("No se encontró la tabla en la página. Probá ‘Usar HTML subido’.")
         except Exception as e:
-            st.error(f"No se pudo abrir la imagen: {e}")
-            st.stop()
+            st.error(f"No pude leer Cronotrigo: {e}")
 
-        w, h = base_img.size
-        orient = _exif_orientation(base_img)
-        st.image(raw, use_container_width=True, caption=f"{file_img.name} · {w}x{h}px · {size_kb} · EXIF: {orient}")
-
-        with st.spinner("Leyendo texto (OCR)…"):
-            ocr_txt = ocr_text_from_image(raw, inv=inv, thr_ui=thr_ui)
-
-        if not ocr_txt or len(ocr_txt.strip()) < 15:
-            st.error("No se pudo leer texto de la imagen.")
-            st.info(
-                f"Archivo: **{file_img.name}** · Resolución: **{w}x{h}px** · Tamaño: **{size_kb}** · EXIF: **{orient}**\n\n"
-                "- Probá mayor resolución (≥ 1200 px de ancho).\n"
-                "- Ajustá *Umbral* ±20–40.\n"
-                "- Activá/Desactivá **Probar inversión**."
-            )
-            st.markdown("### Diagnóstico OCR")
-            thumbs = _make_debug_variants(base_img, thr_ui=thr_ui, inv=inv)
-            c1, c2 = st.columns(2)
-            for i, (title, pilim) in enumerate(thumbs):
-                (c1 if i % 2 == 0 else c2).image(pilim, caption=title, use_container_width=True)
-
-            # ZIP diagnóstico
-            with io.BytesIO() as mem:
-                with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("README.txt", "Variantes de preprocesado (sin OpenCV) para diagnóstico OCR.\n")
-                    for i, (title, pilim) in enumerate(thumbs):
-                        buf = io.BytesIO(); pilim.save(buf, format="PNG"); buf.seek(0)
-                        zf.writestr(f"variant_{i:02d}.png", buf.read())
-                mem.seek(0)
-                st.download_button("⬇ Descargar variantes (ZIP diagnóstico)", data=mem.read(),
-                                   file_name="ocr_diagnostico_variantes.zip", mime="application/zip")
-        else:
-            st.success(f"OCR OK: {len(ocr_txt)} caracteres detectados.")
+else:  # "Usar HTML subido"
+    if cronot_html_file is not None:
+        try:
+            html_text = cronot_html_file.read().decode("utf-8", errors="ignore")
+            cronot_df = _scrape_cronotrigo_table(html_text)
+            if cronot_df is not None:
+                st.success("Tabla de riesgos leída desde el HTML subido.")
+                st.dataframe(cronot_df, use_container_width=True)
+            else:
+                st.warning("No encontré la tabla en este HTML. Asegurate de subir la página correcta.")
+        except Exception as e:
+            st.error(f"No pude procesar el HTML subido: {e}")
     else:
-        st.info("Subí una imagen para continuar.")
-
-with colR:
-    st.subheader("Resultados extraídos")
-    if ocr_txt and len(ocr_txt.strip()) >= 15:
-        try:
-            estados, ventanas, key_dates, meta, T = parse_cronotrigo_text(ocr_txt)
-            with st.expander("Texto detectado (OCR)"):
-                st.code(T[:4000])
-            st.markdown("**Estadios**"); st.dataframe(estados, use_container_width=True)
-            st.markdown("**Período crítico**"); st.table(ventanas)
-            if isinstance(meta, dict):
-                if not np.isnan(meta.get("AguaSuelo_frac", np.nan)):
-                    st.info(f"Agua en Suelo (extraída): ~{meta['AguaSuelo_frac']*100:.0f}%")
-                if not np.isnan(meta.get("TT_aprox", np.nan)):
-                    st.info(f"Tiempo térmico (aprox.): {meta['TT_aprox']:.0f} °C·día")
-        except Exception as e:
-            st.error(f"No se pudo interpretar la imagen: {e}")
-            estados = ventanas = key_dates = None
+        st.info("Subí el archivo HTML para continuar.")
 
 # ================== PREDWEEM ==================
 st.subheader("Serie PREDWEEM")
@@ -566,46 +330,7 @@ def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=
     mp = {pal[0]: pal[1], pb[0]: pb[1], pa[0]: pa[1]}
     return serie.map(mp).fillna("#808080").to_numpy()
 
-def add_periodo_critico(fig, ventanas):
-    try:
-        pc = ventanas.iloc[0]
-        if pd.notna(pc["Inicio"]) and pd.notna(pc["Fin"]) and (pc["Inicio"] < pc["Fin"]):
-            fig.add_vrect(x0=pc["Inicio"], x1=pc["Fin"], fillcolor="rgba(255,0,0,0.12)",
-                          line_width=0, layer="below", annotation_text="Período crítico",
-                          annotation_position="top left")
-    except Exception:
-        pass
-
-def integrar_metricas(pred_df, key_dates, ventanas):
-    z31 = key_dates.get("Primer_nudo", pd.NaT) if key_dates else pd.NaT
-    esp = key_dates.get("Espigazon", pd.NaT) if key_dates else pd.NaT
-    def pct_before(corte):
-        if pd.isna(corte): return float("nan")
-        m = pred_df.loc[pred_df["Fecha"] <= corte, "EMERREL acumulado"]
-        return float(m.max()) if len(m) else float("nan")
-    pct_antes_z31 = pct_before(z31)
-    pct_antes_esp = pct_before(esp)
-    if ventanas is not None and len(ventanas):
-        pc = ventanas.iloc[0]
-        if pd.notna(pc["Inicio"]) and pd.notna(pc["Fin"]) and (pc["Inicio"] < pc["Fin"]):
-            sub = pred_df[(pred_df["Fecha"]>=pc["Inicio"]) & (pred_df["Fecha"]<=pc["Fin"])]
-            pct_en_pc = float(sub["EMERREL(0-1)"].sum()); pct_en_pc = min(pct_en_pc, 1.0)
-        else:
-            pct_en_pc = float("nan")
-    else:
-        pct_en_pc = float("nan")
-    return pd.DataFrame([{
-        "Emerg. rel. antes Z31": pct_antes_z31,
-        "Emerg. rel. antes Espigazón": pct_antes_esp,
-        "Emerg. rel. en Período crítico": pct_en_pc
-    }])
-
-def rgba(hex_color, alpha=0.15):
-    hex_color = hex_color.lstrip("#")
-    r = int(hex_color[0:2],16); g = int(hex_color[2:4],16); b = int(hex_color[4:6],16)
-    return f"rgba({r},{g},{b},{alpha})"
-
-fig_er = fig_ac = fig_tl = None
+fig_er = fig_ac = None
 if pred_vis is not None and len(pred_vis):
     pred_plot = pred_vis.copy()
     if "Nivel" not in pred_plot.columns:
@@ -629,7 +354,6 @@ if pred_vis is not None and len(pred_vis):
                    name="EMERREL (0-1)")
     fig_er.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
     fig_er.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
-    if ventanas is not None: add_periodo_critico(fig_er, ventanas)
     fig_er.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
                          height=520, legend_title="Referencias")
     st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
@@ -648,69 +372,45 @@ if pred_vis is not None and len(pred_vis):
     for nivel in [25,50,75,90]:
         try: fig_ac.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
         except Exception: pass
-    if ventanas is not None: add_periodo_critico(fig_ac, ventanas)
     fig_ac.update_layout(xaxis_title="Fecha", yaxis_title="EMEAC (%)", hovermode="x unified",
                          height=480, legend_title="Referencias")
     st.plotly_chart(fig_ac, use_container_width=True, theme="streamlit")
 
-    if key_dates is not None:
-        st.subheader("Métricas integradas (CRONOTrigo + PREDWEEM)")
-        resumen = integrar_metricas(pred_plot, key_dates, ventanas).fillna(0.0)
-        st.dataframe(resumen.style.format({c:"{:.0%}" for c in resumen.columns}), use_container_width=True)
-
-if estados is not None:
-    st.subheader("CRONOTrigo · Línea de tiempo fenológica")
-    fig_tl = go.Figure()
-    if ventanas is not None: add_periodo_critico(fig_tl, ventanas)
-    y = 1
-    for _, r in estados.sort_values("Fecha").iterrows():
-        if pd.isna(r["Fecha"]): continue
-        fig_tl.add_vline(x=r["Fecha"], line=dict(color="rgba(0,0,0,0.5)", width=1))
-        fig_tl.add_annotation(x=r["Fecha"], y=y, text=r["Estadio"], showarrow=True, arrowhead=2, yshift=30)
-    fechas = estados["Fecha"].dropna()
-    if len(fechas):
-        fi, ff = fechas.min() - pd.Timedelta(days=10), fechas.max() + pd.Timedelta(days=10)
-        fig_tl.add_scatter(x=[fi, ff], y=[y, y], mode="lines", line=dict(width=0), showlegend=False)
-    fig_tl.update_yaxes(visible=False, range=[0, 2])
-    fig_tl.update_layout(xaxis_title="Fecha", hovermode="x unified", height=300)
-    st.plotly_chart(fig_tl, use_container_width=True, theme="streamlit")
-
 # ================== Descargas ==================
 st.subheader("Descargas")
-cols = st.columns(4)
-if estados is not None:
-    buf = io.StringIO(); e_out = estados.copy(); e_out["Fecha"] = e_out["Fecha"].dt.strftime("%Y-%m-%d")
-    e_out.to_csv(buf, index=False)
-    cols[0].download_button("⬇ Estadios (CSV)", data=buf.getvalue(), file_name="cronotrigo_estadios_ocr.csv", mime="text/csv")
-if ventanas is not None:
-    buf2 = io.StringIO(); v_out = ventanas.copy()
-    if "Duración (d)" in v_out.columns: v_out.rename(columns={"Duración (d)":"Duracion_d"}, inplace=True)
-    v_out.to_csv(buf2, index=False)
-    cols[1].download_button("⬇ Período crítico (CSV)", data=buf2.getvalue(), file_name="cronotrigo_periodo_critico.csv", mime="text/csv")
-if 'pred_vis' in locals() and pred_vis is not None:
-    buf3 = io.StringIO(); pred_vis.to_csv(buf3, index=False)
-    cols[2].download_button("⬇ Serie PREDWEEM (CSV)", data=buf3.getvalue(), file_name="predweem_serie.csv", mime="text/csv")
+cols = st.columns(3)
 
+# Descarga tabla CRONOTRIGO (si se obtuvo)
+if cronot_df is not None:
+    buf_ct = io.StringIO()
+    cronot_df.to_csv(buf_ct, index=False)
+    cols[0].download_button("⬇ Tabla CRONOTRIGO (CSV)", data=buf_ct.getvalue(),
+                            file_name="cronotrigo_tabla_riesgos.csv", mime="text/csv")
+
+# Serie PREDWEEM (si existe)
+if pred_vis is not None:
+    buf3 = io.StringIO(); pred_vis.to_csv(buf3, index=False)
+    cols[1].download_button("⬇ Serie PREDWEEM (CSV)", data=buf3.getvalue(),
+                            file_name="predweem_serie.csv", mime="text/csv")
+
+# Paquete ZIP (gráficos + datos disponibles)
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
-zip_ready = (estados is not None) or (ventanas is not None) or ('pred_vis' in locals() and pred_vis is not None)
+zip_ready = (cronot_df is not None) or (pred_vis is not None)
 if zip_ready:
     with io.BytesIO() as mem:
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            if estados is not None:
-                _b = io.StringIO(); e_out = estados.copy(); e_out["Fecha"] = e_out["Fecha"].dt.strftime("%Y-%m-%d")
-                e_out.to_csv(_b, index=False); zf.writestr("cronotrigo_estadios_ocr.csv", _b.getvalue())
-            if ventanas is not None:
-                _b = io.StringIO(); v_out = ventanas.copy()
-                if "Duración (d)" in v_out.columns: v_out.rename(columns={"Duración (d)":"Duracion_d"}, inplace=True)
-                v_out.to_csv(_b, index=False); zf.writestr("cronotrigo_periodo_critico.csv", _b.getvalue())
-            if 'pred_vis' in locals() and pred_vis is not None:
-                _b = io.StringIO(); pred_vis.to_csv(_b, index=False); zf.writestr("predweem_serie.csv", _b.getvalue())
-            # gráficos
-            if 'fig_er' in locals() and fig_er is not None: zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
-            if 'fig_ac' in locals() and fig_ac is not None: zf.writestr("grafico_emeac.html", fig_to_html_bytes(fig_ac))
-            if 'fig_tl' in locals() and fig_tl is not None: zf.writestr("timeline_cronotrigo.html", fig_to_html_bytes(fig_tl))
+            if cronot_df is not None:
+                _b = io.StringIO(); cronot_df.to_csv(_b, index=False)
+                zf.writestr("cronotrigo_tabla_riesgos.csv", _b.getvalue())
+            if pred_vis is not None:
+                _b = io.StringIO(); pred_vis.to_csv(_b, index=False)
+                zf.writestr("predweem_serie.csv", _b.getvalue())
+            if 'fig_er' in locals() and fig_er is not None:
+                zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
+            if 'fig_ac' in locals() and fig_ac is not None:
+                zf.writestr("grafico_emeac.html", fig_to_html_bytes(fig_ac))
         mem.seek(0)
-        st.download_button("⬇ Descargar TODO (ZIP)", data=mem.read(), file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
-
+        cols[2].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
+                                file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
