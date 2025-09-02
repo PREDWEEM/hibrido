@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_overlap_2025.py
-# CRONOTRIGO (web) + PREDWEEM con "overlap" y horizonte fijo 01/02/2025–01/11/2025
+# app_cronotrigo_predweem_overlap_2025_minimal.py
+# CRONOTRIGO (web) + PREDWEEM con overlap simplificado:
+# - Muestra SOLO "% EMERREL en PC / Total"
+# - Elimina el gráfico EMEAC
+# - Horizonte fijo 01/02/2025–01/11/2025 para datos, gráficos y overlap
 
 import io, re, zipfile
 from pathlib import Path
@@ -72,12 +75,6 @@ def rgba(hex_color, alpha=0.15):
     hex_color = hex_color.lstrip("#")
     r = int(hex_color[0:2],16); g = int(hex_color[2:4],16); b = int(hex_color[4:6],16)
     return f"rgba({r},{g},{b},{alpha})"
-
-def _date_or_none(x):
-    try:
-        return pd.to_datetime(x, dayfirst=True, errors="coerce")
-    except Exception:
-        return pd.NaT
 
 # ================== CRONOTRIGO (WEB) ==================
 CRONOTRIGO_URL = "https://cronotrigo.agro.uba.ar/index.php/cronos/AR"
@@ -152,7 +149,6 @@ def fetch_cronotrigo_html() -> str:
 # ================== PREDWEEM ==================
 THR_BAJO_MEDIO = 0.020
 THR_MEDIO_ALTO = 0.079
-EMEAC_MIN_DEN, EMEAC_ADJ_DEN, EMEAC_MAX_DEN = 1.8, 2.1, 2.5
 
 GITHUB_WEIGHTS = "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main"
 FNAME_IW, FNAME_BIW, FNAME_LW, FNAME_BOUT = "IW.npy", "bias_IW.npy", "LW.npy", "bias_out.npy"
@@ -176,7 +172,7 @@ def load_public_csv():
 def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Julian_days","TMAX","TMIN","Prec"]
     out = df.copy()
-    for c in cols: out[c] = pd.to_numeric(out[c], errors="coerce")
+    for c in cols: out[c] = pd.to_numeric(cast := df[c], errors="coerce")
     out[cols] = out[cols].interpolate(limit_direction="both")
     out["Julian_days"] = out["Julian_days"].clip(1, 366)
     out["Prec"] = out["Prec"].clip(lower=0)
@@ -211,7 +207,7 @@ class PracticalANNModel:
         return 2 * (Xc - self.input_min) / self._den - 1
     def _denorm_out(self, y, ymin=-1, ymax=1):  # tansig^-1 normalizado a 0..1
         return (y - ymin) / (ymax - ymin)
-    def predict(self, X_real):
+    def predict(self, X_real, IW, b1, LW, b2):
         Xn = self._norm(X_real)
         z1 = Xn @ IW + b1
         a1 = np.tanh(z1)
@@ -229,11 +225,10 @@ def run_predweem_simple(df_meteo: pd.DataFrame):
     if "Fecha" not in df.columns or not np.issubdtype(df["Fecha"].dtype, np.datetime64):
         year = pd.Timestamp.now().year
         df["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-    global IW, b1, LW, b2
     IW, b1, LW, b2 = _cargar_pesos()
     model = PracticalANNModel(IW, b1, LW, b2)
     X = df[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
-    out = model.predict(X)
+    out = model.predict(X, IW, b1, LW, b2)
     out["Fecha"] = pd.to_datetime(df["Fecha"])
     out["Julian_days"] = df["Julian_days"].values
     out["EMERREL acumulado"] = out["EMERREL(0-1)"].cumsum().clip(upper=1.0)
@@ -425,18 +420,16 @@ def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, di
     emerrel_total = float(pred_df["EMERREL(0-1)"].sum())
     pct_pc_sobre_total = emerrel_pc / emerrel_total if emerrel_total > 0 else np.nan
     resumen = {
-        "EMERREL en PC": min(emerrel_pc, 1.0),
-        "EMERREL total": emerrel_total,
         "% EMERREL en PC / total": pct_pc_sobre_total
     }
     return sub.reset_index(drop=True), resumen
 
-# ================== Gráficos ==================
+# ================== Gráfico EMERREL ==================
 def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=("Alto","#d62728")):
     mp = {pal[0]: pal[1], pb[0]: pb[1], pa[0]: pa[1]}
     return serie.map(mp).fillna("#808080").to_numpy()
 
-fig_er = fig_ac = None
+fig_er = None
 overlap_df = pd.DataFrame()
 overlap_res = {}
 
@@ -468,37 +461,16 @@ if pred_vis is not None and len(pred_vis):
                          height=520, legend_title="Referencias")
     st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-    st.subheader("EMEAC (%)")
-    emeac = pd.DataFrame({
-        "Fecha": pred_plot["Fecha"],
-        "EMEAC_min": (pred_plot["EMERREL acumulado"]/EMEAC_MIN_DEN*100).clip(0,100),
-        "EMEAC_adj": (pred_plot["EMERREL acumulado"]/EMEAC_ADJ_DEN*100).clip(0,100),
-        "EMEAC_max": (pred_plot["EMERREL acumulado"]/EMEAC_MAX_DEN*100).clip(0,100)
-    })
-    fig_ac = go.Figure()
-    fig_ac.add_trace(go.Scatter(x=emeac["Fecha"], y=emeac["EMEAC_max"], mode="lines", line=dict(width=0), name="Máximo"))
-    fig_ac.add_trace(go.Scatter(x=emeac["Fecha"], y=emeac["EMEAC_min"], mode="lines", line=dict(width=0), fill="tonexty", name="Mínimo"))
-    fig_ac.add_trace(go.Scatter(x=emeac["Fecha"], y=emeac["EMEAC_adj"], mode="lines", line=dict(width=2.5), name=f"Ajustable (/{EMEAC_ADJ_DEN:.2f})"))
-    for nivel in [25,50,75,90]:
-        try: fig_ac.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
-        except Exception: pass
-    add_pc_shading(fig_ac, pc_inicio, pc_fin)
-    fig_ac.update_layout(xaxis_title="Fecha", yaxis_title="EMEAC (%)", hovermode="x unified",
-                         height=480, legend_title="Referencias")
-    st.plotly_chart(fig_ac, use_container_width=True, theme="streamlit")
-
-    # --- OVERLAP ---
-    st.subheader("Overlap CRONOTRIGO × PREDWEEM (EMERREL dentro del PC)")
+    # --- OVERLAP (solo % en PC / Total) ---
+    st.subheader("Overlap CRONOTRIGO × PREDWEEM")
     if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
         overlap_df, overlap_res = compute_overlap(pred_plot, pc_inicio, pc_fin)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("EMERREL en PC", f"{overlap_res.get('EMERREL en PC', 0):.0%}")
-        c2.metric("EMERREL total", f"{overlap_res.get('EMERREL total', 0):.0%}")
         pct_pc_tot = overlap_res.get("% EMERREL en PC / total", np.nan)
-        c3.metric("% en PC / Total", f"{pct_pc_tot:.0%}" if pd.notna(pct_pc_tot) else "—")
+        st.metric("% EMERREL en PC / Total", f"{pct_pc_tot:.0%}" if pd.notna(pct_pc_tot) else "—")
 
         st.markdown(f"**Período crítico aplicado:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
                     f"· **Días:** {(pc_fin - pc_inicio).days + 1}")
+
         if not overlap_df.empty:
             st.dataframe(overlap_df, use_container_width=True)
         else:
@@ -547,8 +519,7 @@ if zip_ready:
                 zf.writestr("overlap_predweem_pc_2025.csv", _b.getvalue())
             if 'fig_er' in locals() and fig_er is not None:
                 zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
-            if 'fig_ac' in locals() and fig_ac is not None:
-                zf.writestr("grafico_emeac.html", fig_to_html_bytes(fig_ac))
+            # NOTA: No se incluye grafico_emeac.html porque eliminamos ese gráfico.
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_paquete_2025.zip", mime="application/zip")
