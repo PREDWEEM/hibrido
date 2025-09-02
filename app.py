@@ -2,8 +2,8 @@
 # app_cronotrigo_predweem_overlap_2025_minimal.py
 # CRONOTRIGO (web) + PREDWEEM con overlap simplificado:
 # - Muestra SOLO "% EMERREL en PC / Total"
-# - Elimina la tabla de resultados del overlap (no se muestra DataFrame)
-# - Elimina el gráfico EMEAC
+# - No muestra tabla de CRONOTRIGO en pantalla
+# - Elimina el gráfico EMEAC y la tabla de resultados del overlap
 # - Horizonte fijo 01/02/2025–01/11/2025 para datos, gráficos y overlap
 
 import io, re, zipfile
@@ -106,9 +106,7 @@ def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
     return pd.DataFrame(rows, columns=headers)
 
 def _extract_pc_from_html_text(html_text: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    """
-    Intenta encontrar 'Período crítico' en el HTML (heurística con 2 fechas cercanas).
-    """
+    """Intenta encontrar 'Período crítico' en el HTML (heurística con 2 fechas cercanas)."""
     text = BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True) if _BS4_OK else html_text
     idx = text.lower().find("período crítico")
     if idx == -1:
@@ -323,7 +321,7 @@ with st.sidebar:
     elif modo_pred == "API MeteoBahía (XML)":
         meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml")
 
-# ================== CRONOTRIGO: Visualización / Datos + PC ==================
+# ================== CRONOTRIGO: Visualización / PC ==================
 st.subheader("CRONOTRIGO – Resultados FAUBA")
 st.caption("Horizonte aplicado: 01/02/2025 → 01/11/2025")
 
@@ -340,14 +338,11 @@ elif modo_crono == "Extraer tabla (vivo)":
     with st.spinner("Consultando CRONOTRIGO…"):
         try:
             html_text = fetch_cronotrigo_html()
-            cronot_df = _scrape_cronotrigo_table(html_text)
-            if cronot_df is not None:
-                st.success("Tabla de riesgos extraída correctamente.")
-                st.dataframe(cronot_df, use_container_width=True)
-            else:
-                st.warning("No se encontró la tabla o falta BeautifulSoup.")
-            p1, p2 = _extract_pc_from_html_text(html_text)
+            # (NO mostrar tabla en pantalla)
+            cronot_df = _scrape_cronotrigo_table(html_text)  # útil para descarga si se quiere
+            p1, p2 = _extract_pc_from_html_text(html_text)   # extrae PC
             pc_inicio, pc_fin = p1, p2
+            st.success("Período Crítico detectado desde la página (si estaba presente).")
         except Exception as e:
             st.error(f"No pude leer CRONOTRIGO: {e}")
 
@@ -355,14 +350,11 @@ else:  # "Usar HTML subido"
     if cronot_html_file is not None:
         try:
             html_text = cronot_html_file.read().decode("utf-8", errors="ignore")
-            cronot_df = _scrape_cronotrigo_table(html_text)
-            if cronot_df is not None:
-                st.success("Tabla de riesgos leída desde el HTML subido.")
-                st.dataframe(cronot_df, use_container_width=True)
-            else:
-                st.warning("No encontré la tabla en este HTML.")
+            # (NO mostrar tabla en pantalla)
+            cronot_df = _scrape_cronotrigo_table(html_text)  # útil para descarga si se quiere
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
+            st.success("HTML leído y PC detectado (si estaba presente).")
         except Exception as e:
             st.error(f"No pude procesar el HTML subido: {e}")
     else:
@@ -421,9 +413,7 @@ def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, di
     emerrel_pc = float(sub["EMERREL(0-1)"].sum()) if len(sub) else 0.0
     emerrel_total = float(pred_df["EMERREL(0-1)"].sum())
     pct_pc_sobre_total = emerrel_pc / emerrel_total if emerrel_total > 0 else np.nan
-    resumen = {
-        "% EMERREL en PC / total": pct_pc_sobre_total
-    }
+    resumen = {"% EMERREL en PC / total": pct_pc_sobre_total}
     return sub.reset_index(drop=True), resumen
 
 # ================== Gráfico EMERREL ==================
@@ -472,8 +462,7 @@ if pred_vis is not None and len(pred_vis):
 
         st.markdown(f"**Período crítico aplicado:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
                     f"· **Días:** {(pc_fin - pc_inicio).days + 1}")
-
-        # No mostramos más la tabla de resultados (DataFrame) del overlap
+        # NO mostramos la tabla del overlap
         if overlap_df.empty:
             st.info("No hay días del pronóstico/modelo dentro del Período Crítico en el horizonte.")
     else:
@@ -483,7 +472,7 @@ if pred_vis is not None and len(pred_vis):
 st.subheader("Descargas")
 cols = st.columns(4)
 
-# Descarga tabla CRONOTRIGO (si se obtuvo)
+# (Opcional) CSV de CRONOTRIGO para quien lo necesite (aunque no lo mostramos en pantalla)
 if cronot_df is not None:
     buf_ct = io.StringIO(); cronot_df.to_csv(buf_ct, index=False)
     cols[0].download_button("⬇ Tabla CRONOTRIGO (CSV)", data=buf_ct.getvalue(),
@@ -495,7 +484,7 @@ if pred_vis is not None and not pred_vis.empty:
     cols[1].download_button("⬇ Serie PREDWEEM (CSV)", data=buf_p.getvalue(),
                             file_name="predweem_serie_2025_clip.csv", mime="text/csv")
 
-# Overlap (si existe) — mantenemos la descarga aunque no se muestre la tabla
+# Overlap (si existe) — mantenemos la descarga aunque no se muestre tabla
 if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
     buf_o = io.StringIO(); overlap_df.to_csv(buf_o, index=False)
     cols[2].download_button("⬇ Overlap (PC × EMERREL) (CSV)", data=buf_o.getvalue(),
@@ -523,4 +512,3 @@ if zip_ready:
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_paquete_2025.zip", mime="application/zip")
-
