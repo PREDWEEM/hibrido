@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_no_cv2.py
-# CRONOTrigo + PREDWEEM con OCR optimizado (sin OpenCV)
+# app_cronotrigo_predweem_no_cv2_fixed.py
+# CRONOTrigo + PREDWEEM con OCR optimizado (sin OpenCV) + fix UnsharpMask
 
 import io, re, zipfile, hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -99,26 +99,40 @@ def _preprocess_for_ocr_purepil(img: Image.Image, scale=2.5, invert=False, thr=N
     """
     Preprocesado sin OpenCV:
     - Resize (LANCZOS)
-    - Autocontrast + incremento de contraste y nitidez
+    - Autocontrast + incremento de contraste
+    - Nitidez con UnsharpMask (o Sharpness si hay error)
     - Binarización simple por percentil/umbral
     - Inversión opcional
     """
+    # Resize
     w, h = img.size
     img2 = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+
+    # Escala de grises + ajuste de contraste
     g = ImageOps.grayscale(img2)
     g = ImageOps.autocontrast(g)
     g = ImageEnhance.Contrast(g).enhance(1.5)
-    g = ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=2).filter(g)
 
-    arr = np.asarray(g).astype(np.uint8)
+    # Nitidez correcta (image.filter(...))
+    try:
+        g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=2))
+    except Exception:
+        g = ImageEnhance.Sharpness(g).enhance(1.4)
+
+    # Binarización
+    import numpy as _np
+    arr = _np.asarray(g).astype(_np.uint8)
     if thr is None:
-        t = int(np.percentile(arr, 60))
+        t = int(_np.percentile(arr, 60))
     else:
         t = int(thr)
-    bin_arr = (arr > t).astype(np.uint8) * 255
+    bin_arr = (arr > t).astype(_np.uint8) * 255
     out = Image.fromarray(bin_arr, mode="L")
+
+    # Inversión opcional
     if invert:
         out = ImageOps.invert(out)
+
     return out.convert("RGB")
 
 def _img_sha1(img_bytes: bytes) -> str:
@@ -160,7 +174,7 @@ def ocr_text_from_image(img_bytes: bytes, inv=True, thr_ui=160) -> str:
         for thr in (thr_ui-20, thr_ui, thr_ui+20):
             variants.append(_preprocess_for_ocr_purepil(base, scale=2.3, invert=invert, thr=max(50, min(220, thr))))
 
-    # 2) Banda inferior (tarjetas): OCR tal cual (sin detección de cajas)
+    # 2) Banda inferior (tarjetas)
     W, H = base.size
     y0 = int(H*0.58)
     band = base.crop((0, y0, W, H))
@@ -699,3 +713,4 @@ if zip_ready:
             if 'fig_tl' in locals() and fig_tl is not None: zf.writestr("timeline_cronotrigo.html", fig_to_html_bytes(fig_tl))
         mem.seek(0)
         st.download_button("⬇ Descargar TODO (ZIP)", data=mem.read(), file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
+
