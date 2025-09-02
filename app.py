@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_overlap.py
-# CRONOTrigo (web) + PREDWEEM con "overlap" (EMERREL dentro del Período Crítico)
+# app_cronotrigo_predweem_overlap_2025.py
+# CRONOTRIGO (web) + PREDWEEM con "overlap" y horizonte fijo 01/02/2025–01/11/2025
 
-import io, re, zipfile, datetime as dt
+import io, re, zipfile
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +21,7 @@ except Exception:
     _BS4_OK = False
 
 # ================== UI ==================
-st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Overlap", layout="wide")
+st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Overlap 2025", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -29,7 +29,31 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTRIGO + PREDWEEM · Overlap (Período Crítico vs EMERREL)")
+st.title("CRONOTRIGO + PREDWEEM · Overlap (horizonte 2025)")
+
+# ==== Horizonte fijo 2025 ====
+HORIZ_INI = pd.Timestamp("2025-02-01")
+HORIZ_FIN = pd.Timestamp("2025-11-01")
+
+def clip_horizon(df: pd.DataFrame | None, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame | None:
+    if df is None or len(df)==0 or "Fecha" not in df.columns:
+        return df
+    m = (df["Fecha"] >= start) & (df["Fecha"] <= end)
+    out = df.loc[m].copy()
+    if "Fecha" in out.columns:
+        out.sort_values("Fecha", inplace=True)
+        out.reset_index(drop=True, inplace=True)
+    return out
+
+def clip_pc(pc_i: pd.Timestamp | None, pc_f: pd.Timestamp | None,
+            start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if pc_i is None or pc_f is None:
+        return (pc_i, pc_f)
+    a = max(pc_i, start)
+    b = min(pc_f, end)
+    if b < a:
+        return (None, None)
+    return (a, b)
 
 # ================== Utils ==================
 def _norm_col(df, aliases):
@@ -57,11 +81,10 @@ def _date_or_none(x):
 
 # ================== CRONOTRIGO (WEB) ==================
 CRONOTRIGO_URL = "https://cronotrigo.agro.uba.ar/index.php/cronos/AR"
-
 DATE_PAT_HTML = re.compile(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?")
 
 def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
-    """Devuelve la tabla de riesgos (id='table-riesgos') o None si no está."""
+    """Devuelve la tabla de riesgos (id='table-riesgos') o None si no está / falta bs4."""
     if not _BS4_OK:
         return None
     soup = BeautifulSoup(html_text, "html.parser")
@@ -72,8 +95,7 @@ def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
     rows = []
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
-        if not tds:
-            continue
+        if not tds: continue
         rows.append([td.get_text(strip=True) for td in tds])
     if not rows:
         return None
@@ -87,27 +109,22 @@ def _scrape_cronotrigo_table(html_text: str) -> pd.DataFrame | None:
 
 def _extract_pc_from_html_text(html_text: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     """
-    Intenta encontrar el 'Período crítico' en el HTML de CRONOTRIGO.
-    Heurística: busca textos con 'Período crítico' (o sin tilde), luego extrae dos fechas.
+    Intenta encontrar 'Período crítico' en el HTML (heurística con 2 fechas cercanas).
     """
     text = BeautifulSoup(html_text, "html.parser").get_text(" ", strip=True) if _BS4_OK else html_text
-    # matcheos por "período crítico" o "periodo critico"
     idx = text.lower().find("período crítico")
     if idx == -1:
         idx = text.lower().find("periodo critico")
     if idx == -1:
         return (None, None)
-    # recorta ventana alrededor
     start = max(0, idx - 200)
     end = min(len(text), idx + 200)
     snippet = text[start:end]
     dates = DATE_PAT_HTML.findall(snippet)
     if len(dates) < 2:
-        # intenta buscar en más texto si no alcanza
         dates = DATE_PAT_HTML.findall(text)
         if len(dates) < 2:
             return (None, None)
-    # arma fechas con año por defecto (año actual)
     year = pd.Timestamp.now().year
     def mkdate(t):
         d, m, y = int(t[0]), int(t[1]), t[2]
@@ -122,9 +139,7 @@ def _extract_pc_from_html_text(html_text: str) -> tuple[pd.Timestamp | None, pd.
     d1 = mkdate(dates[0]); d2 = mkdate(dates[1])
     if pd.isna(d1) or pd.isna(d2):
         return (None, None)
-    # ordenar
-    if d2 < d1:
-        d1, d2 = d2, d1
+    if d2 < d1: d1, d2 = d2, d1
     return (d1, d2)
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -313,6 +328,8 @@ with st.sidebar:
 
 # ================== CRONOTRIGO: Visualización / Datos + PC ==================
 st.subheader("CRONOTRIGO – Resultados FAUBA")
+st.caption("Horizonte aplicado: 01/02/2025 → 01/11/2025")
+
 cronot_df = None
 pc_inicio = None
 pc_fin = None
@@ -331,8 +348,7 @@ elif modo_crono == "Extraer tabla (vivo)":
                 st.success("Tabla de riesgos extraída correctamente.")
                 st.dataframe(cronot_df, use_container_width=True)
             else:
-                st.warning("No se encontró la tabla en la página o falta BeautifulSoup.")
-            # Intento extraer PC del HTML
+                st.warning("No se encontró la tabla o falta BeautifulSoup.")
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
         except Exception as e:
@@ -348,7 +364,6 @@ else:  # "Usar HTML subido"
                 st.dataframe(cronot_df, use_container_width=True)
             else:
                 st.warning("No encontré la tabla en este HTML.")
-            # Intento extraer PC del HTML subido
             p1, p2 = _extract_pc_from_html_text(html_text)
             pc_inicio, pc_fin = p1, p2
         except Exception as e:
@@ -385,6 +400,15 @@ try:
 except Exception as e:
     st.error(f"No se pudo generar la serie de PREDWEEM: {e}")
 
+# --- Recorte de horizonte fijo 2025-02-01 a 2025-11-01 ---
+if pred_vis is not None:
+    pred_vis = clip_horizon(pred_vis, HORIZ_INI, HORIZ_FIN)
+    if pred_vis is None or pred_vis.empty:
+        st.warning("No hay datos de PREDWEEM en el horizonte 01/02/2025 → 01/11/2025.")
+
+# Ajustar PC al mismo horizonte
+pc_inicio, pc_fin = clip_pc(pc_inicio, pc_fin, HORIZ_INI, HORIZ_FIN)
+
 # ================== OVERLAP (PC vs EMERREL) ==================
 def add_pc_shading(fig, pc_i, pc_f):
     if pc_i is not None and pc_f is not None and pc_i < pc_f:
@@ -393,11 +417,6 @@ def add_pc_shading(fig, pc_i, pc_f):
                       annotation_text="Período crítico", annotation_position="top left")
 
 def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f) -> tuple[pd.DataFrame, dict]:
-    """
-    Devuelve (tabla_overlap, resumen_dict)
-    - tabla_overlap: filas de pred_df dentro de [pc_i, pc_f] con EMERREL y nivel
-    - resumen: métricas agregadas del overlap
-    """
     if pc_i is None or pc_f is None or pc_i >= pc_f or pred_df is None or pred_df.empty:
         return pd.DataFrame(), {}
     mask = (pred_df["Fecha"] >= pc_i) & (pred_df["Fecha"] <= pc_f)
@@ -428,7 +447,6 @@ if pred_vis is not None and len(pred_vis):
         pred_plot["Nivel"] = np.where(pred_plot["EMERREL(0-1)"] <= th1, "Bajo",
                                np.where(pred_plot["EMERREL(0-1)"] <= th2, "Medio", "Alto"))
 
-    # --- Gráfico EMERREL diario + MA5 + sombreado del PC ---
     st.subheader("EMERREL diario (MA5 + sombreado PC)")
     colors = colores_por_nivel(pred_plot["Nivel"])
     fig_er = go.Figure()
@@ -450,7 +468,6 @@ if pred_vis is not None and len(pred_vis):
                          height=520, legend_title="Referencias")
     st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-    # --- Gráfico EMEAC (%) + sombreado PC ---
     st.subheader("EMEAC (%)")
     emeac = pd.DataFrame({
         "Fecha": pred_plot["Fecha"],
@@ -470,7 +487,7 @@ if pred_vis is not None and len(pred_vis):
                          height=480, legend_title="Referencias")
     st.plotly_chart(fig_ac, use_container_width=True, theme="streamlit")
 
-    # --- OVERLAP: métricas + tabla ---
+    # --- OVERLAP ---
     st.subheader("Overlap CRONOTRIGO × PREDWEEM (EMERREL dentro del PC)")
     if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
         overlap_df, overlap_res = compute_overlap(pred_plot, pc_inicio, pc_fin)
@@ -480,14 +497,14 @@ if pred_vis is not None and len(pred_vis):
         pct_pc_tot = overlap_res.get("% EMERREL en PC / total", np.nan)
         c3.metric("% en PC / Total", f"{pct_pc_tot:.0%}" if pd.notna(pct_pc_tot) else "—")
 
-        st.markdown(f"**Período crítico:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
+        st.markdown(f"**Período crítico aplicado:** {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')}  "
                     f"· **Días:** {(pc_fin - pc_inicio).days + 1}")
         if not overlap_df.empty:
             st.dataframe(overlap_df, use_container_width=True)
         else:
-            st.info("No hay días del pronóstico/modelo dentro del Período Crítico.")
+            st.info("No hay días del pronóstico/modelo dentro del Período Crítico en el horizonte.")
     else:
-        st.warning("No se detectó Período Crítico automáticamente. Ingresalo manualmente en la barra lateral.")
+        st.warning("No se detectó/ingresó un Período Crítico válido en el horizonte 2025.")
 
 # ================== Descargas ==================
 st.subheader("Descargas")
@@ -500,39 +517,39 @@ if cronot_df is not None:
                             file_name="cronotrigo_tabla_riesgos.csv", mime="text/csv")
 
 # Serie PREDWEEM (si existe)
-if pred_vis is not None:
+if pred_vis is not None and not pred_vis.empty:
     buf_p = io.StringIO(); pred_vis.to_csv(buf_p, index=False)
     cols[1].download_button("⬇ Serie PREDWEEM (CSV)", data=buf_p.getvalue(),
-                            file_name="predweem_serie.csv", mime="text/csv")
+                            file_name="predweem_serie_2025_clip.csv", mime="text/csv")
 
 # Overlap (si existe)
 if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
     buf_o = io.StringIO(); overlap_df.to_csv(buf_o, index=False)
     cols[2].download_button("⬇ Overlap (PC × EMERREL) (CSV)", data=buf_o.getvalue(),
-                            file_name="overlap_predweem_pc.csv", mime="text/csv")
+                            file_name="overlap_predweem_pc_2025.csv", mime="text/csv")
 
 # Paquete ZIP (gráficos + datos disponibles)
 def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
-zip_ready = (cronot_df is not None) or (pred_vis is not None)
+zip_ready = (cronot_df is not None) or (pred_vis is not None and not pred_vis.empty)
 if zip_ready:
     with io.BytesIO() as mem:
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             if cronot_df is not None:
                 _b = io.StringIO(); cronot_df.to_csv(_b, index=False)
                 zf.writestr("cronotrigo_tabla_riesgos.csv", _b.getvalue())
-            if pred_vis is not None:
+            if pred_vis is not None and not pred_vis.empty:
                 _b = io.StringIO(); pred_vis.to_csv(_b, index=False)
-                zf.writestr("predweem_serie.csv", _b.getvalue())
+                zf.writestr("predweem_serie_2025_clip.csv", _b.getvalue())
             if 'overlap_df' in locals() and overlap_df is not None and not overlap_df.empty:
                 _b = io.StringIO(); overlap_df.to_csv(_b, index=False)
-                zf.writestr("overlap_predweem_pc.csv", _b.getvalue())
+                zf.writestr("overlap_predweem_pc_2025.csv", _b.getvalue())
             if 'fig_er' in locals() and fig_er is not None:
                 zf.writestr("grafico_emerrel.html", fig_to_html_bytes(fig_er))
             if 'fig_ac' in locals() and fig_ac is not None:
                 zf.writestr("grafico_emeac.html", fig_to_html_bytes(fig_ac))
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
-                                file_name="cronotrigo_predweem_paquete.zip", mime="application/zip")
+                                file_name="cronotrigo_predweem_paquete_2025.zip", mime="application/zip")
 
