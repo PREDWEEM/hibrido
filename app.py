@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_base_2025_hist3_pc_compare.py
+# app_cronotrigo_predweem_base_2025_hist3_pc_tabs.py
 # CRONOTRIGO (web) + PREDWEEM:
 # - Serie BASE (2025) con % EMERREL en PC / Total y sombreado del PC
-# - Tres series HISTÓRICAS: ESCALONADO, TEMPRANO y MEDIO (otros años) con PC proyectado por año y métricas por año
-# - Comparativo — para la BASE calcula el promedio de % en PC / Total de cada histórico, mostrando delta vs BASE 2025
+# - Tres series HISTÓRICAS: ESCALONADO, TEMPRANO y MEDIO con PC proyectado por año y métricas por año
+# - Comparativo — promedios de % en PC / Total por histórico y delta vs BASE 2025
 # - Sin tabla de CRONOTRIGO; sin gráfico EMEAC
 # - Acepta históricos con columnas 'fecha' y 'EMEREL' o EMERREL/EMERAC (CSV/XLSX; openpyxl opcional)
 
@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import requests
 
-# === BeautifulSoup opcional ===
+# ============ BeautifulSoup opcional ============
 try:
     from bs4 import BeautifulSoup
     _BS4_OK = True
@@ -34,7 +34,7 @@ header [data-testid="stToolbar"]{visibility:hidden}
 .viewerBadge_container__1QSob,.stAppDeployButton{display:none}
 </style>
 """, unsafe_allow_html=True)
-st.title("CRONOTRIGO + PREDWEEM · Base (2025) + Históricos (Escalonado/Temprano/Medio) con PC")
+st.title("CRONOTRIGO + PREDWEEM · Base (2025) + Históricos (Escalonado / Temprano / Medio) con PC")
 
 # ==== Horizonte fijo para la serie BASE ====
 HORIZ_INI = pd.Timestamp("2025-02-01")
@@ -200,7 +200,7 @@ def run_predweem_simple(df_meteo: pd.DataFrame):
     out["MA5"] = out["EMERREL(0-1)"].rolling(5, min_periods=1).mean()
     return out
 
-# ==== Lectura flexible CSV/XLSX para EMERREL/EMERAC, incluyendo 'fecha' y 'EMEREL' ====
+# ==== Lectura flexible CSV/XLSX para EMERREL/EMERAC (incluye 'fecha' y 'EMEREL') ====
 def _read_table_any(pred_file):
     ext = Path(pred_file.name).suffix.lower()
     if ext == ".csv":
@@ -295,11 +295,9 @@ with st.sidebar:
     st.markdown("---")
     st.header("PREDWEEM · Históricos (archivos aparte)")
     st.caption("Formato simple aceptado: columnas **fecha** y **EMEREL**, o EMERREL/EMERAC (CSV/XLSX).")
-
     hist_escalonado_file = st.file_uploader("HISTÓRICO ESCALONADO (CSV/XLSX)", type=["csv","xlsx"], key="hist_escalonado")
     hist_temprano_file   = st.file_uploader("HISTÓRICO TEMPRANO (CSV/XLSX)",   type=["csv","xlsx"], key="hist_temprano")
     hist_medio_file      = st.file_uploader("HISTÓRICO MEDIO (CSV/XLSX)",      type=["csv","xlsx"], key="hist_medio")
-
     st.caption("💡 Para XLSX, instalá 'openpyxl'; con CSV no hace falta.")
 
 # ================== CRONOTRIGO: Visualización / PC (origen base) ==================
@@ -373,45 +371,6 @@ except RuntimeError as e:
 except Exception as e:
     st.error(f"No se pudo generar la serie BASE: {e}")
 
-# --- HISTÓRICO ESCALONADO ---
-if hist_escalonado_file is not None:
-    try:
-        pred_vis_escalonado = run_predweem_from_file(hist_escalonado_file)
-        st.success(f"HISTÓRICO ESCALONADO cargado: {len(pred_vis_escalonado)} días.")
-    except RuntimeError as e:
-        if "OPENPYXL_MISSING" in str(e):
-            st.warning("No se pudo leer el HISTÓRICO ESCALONADO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
-        else:
-            st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
-    except Exception as e:
-        st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
-
-# --- HISTÓRICO TEMPRANO ---
-if hist_temprano_file is not None:
-    try:
-        pred_vis_temprano = run_predweem_from_file(hist_temprano_file)
-        st.success(f"HISTÓRICO TEMPRANO cargado: {len(pred_vis_temprano)} días.")
-    except RuntimeError as e:
-        if "OPENPYXL_MISSING" in str(e):
-            st.warning("No se pudo leer el HISTÓRICO TEMPRANO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
-        else:
-            st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
-    except Exception as e:
-        st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
-
-# --- HISTÓRICO MEDIO ---
-if hist_medio_file is not None:
-    try:
-        pred_vis_medio = run_predweem_from_file(hist_medio_file)
-        st.success(f"HISTÓRICO MEDIO cargado: {len(pred_vis_medio)} días.")
-    except RuntimeError as e:
-        if "OPENPYXL_MISSING" in str(e):
-            st.warning("No se pudo leer el HISTÓRICO MEDIO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
-        else:
-            st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
-    except Exception as e:
-        st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
-
 # --- Recorte de horizonte SOLO para la BASE ---
 if pred_vis_main is not None:
     pred_vis_main = clip_horizon(pred_vis_main, HORIZ_INI, HORIZ_FIN)
@@ -423,7 +382,6 @@ pc_inicio, pc_fin = clip_pc(pc_inicio, pc_fin, HORIZ_INI, HORIZ_FIN)
 
 # ================== Helpers PC histórico ==================
 def _safe_date_for_year(dt: pd.Timestamp, year: int) -> pd.Timestamp | None:
-    """Devuelve dt con el 'year' solicitado, corrigiendo 29/2 si el año no es bisiesto."""
     if dt is None or pd.isna(dt): return None
     m = int(dt.month); d = int(dt.day)
     last_day = calendar.monthrange(year, m)[1]
@@ -434,7 +392,6 @@ def _safe_date_for_year(dt: pd.Timestamp, year: int) -> pd.Timestamp | None:
         return None
 
 def project_pc_to_year(pc_i: pd.Timestamp | None, pc_f: pd.Timestamp | None, year: int):
-    """Proyecta el PC (día/mes) al 'year' dado, devolviendo (ini, fin)."""
     if pc_i is None or pc_f is None: return (None, None)
     a = _safe_date_for_year(pc_i, year)
     b = _safe_date_for_year(pc_f, year)
@@ -530,7 +487,7 @@ def render_hist_panel(hist_plot: pd.DataFrame | None, titulo: str, fill_hex: str
                              hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"))
     # Barras por nivel
     fig.add_bar(x=dfp["Fecha"], y=dfp["EMERREL(0-1)"],
-                marker=dict(color=colores_por_nivel(dfp["Nivel"]).tolist() ),
+                marker=dict(color=colores_por_nivel(dfp["Nivel"]).tolist()),
                 customdata=dfp["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
                 hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
                 name=f"{titulo} · EMERREL (0-1)")
@@ -567,39 +524,86 @@ def render_hist_panel(hist_plot: pd.DataFrame | None, titulo: str, fill_hex: str
 
     return fig, pc_metrics
 
-# ================== Render HISTÓRICO ESCALONADO / TEMPRANO / MEDIO ==================
+# ================== Render en TABS: HISTÓRICO ESCALONADO / TEMPRANO / MEDIO ==================
 fig_escalonado = fig_temprano = fig_medio = None
 metrics_escalonado = metrics_temprano = metrics_medio = []
 
-if pred_vis_escalonado is not None and len(pred_vis_escalonado):
-    fig_escalonado, metrics_escalonado = render_hist_panel(pred_vis_escalonado, "HISTÓRICO ESCALONADO", fill_hex="#9467bd")
+tab_escalonado, tab_temprano, tab_medio = st.tabs(["Escalonado", "Temprano", "Medio"])
 
-if pred_vis_temprano is not None and len(pred_vis_temprano):
-    fig_temprano,   metrics_temprano   = render_hist_panel(pred_vis_temprano,   "HISTÓRICO TEMPRANO",   fill_hex="#1f77b4")
+with tab_escalonado:
+    if hist_escalonado_file is not None:
+        try:
+            pred_vis_escalonado = run_predweem_from_file(hist_escalonado_file)
+            st.success(f"HISTÓRICO ESCALONADO cargado: {len(pred_vis_escalonado)} días.")
+            fig_escalonado, metrics_escalonado = render_hist_panel(
+                pred_vis_escalonado, "HISTÓRICO ESCALONADO", fill_hex="#9467bd"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO ESCALONADO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Escalonado** para ver este panel.")
 
-if pred_vis_medio is not None and len(pred_vis_medio):
-    fig_medio,      metrics_medio      = render_hist_panel(pred_vis_medio,      "HISTÓRICO MEDIO",      fill_hex="#8c564b")
+with tab_temprano:
+    if hist_temprano_file is not None:
+        try:
+            pred_vis_temprano = run_predweem_from_file(hist_temprano_file)
+            st.success(f"HISTÓRICO TEMPRANO cargado: {len(pred_vis_temprano)} días.")
+            fig_temprano, metrics_temprano = render_hist_panel(
+                pred_vis_temprano, "HISTÓRICO TEMPRANO", fill_hex="#1f77b4"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO TEMPRANO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Temprano** para ver este panel.")
+
+with tab_medio:
+    if hist_medio_file is not None:
+        try:
+            pred_vis_medio = run_predweem_from_file(hist_medio_file)
+            st.success(f"HISTÓRICO MEDIO cargado: {len(pred_vis_medio)} días.")
+            fig_medio, metrics_medio = render_hist_panel(
+                pred_vis_medio, "HISTÓRICO MEDIO", fill_hex="#8c564b"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO MEDIO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Medio** para ver este panel.")
 
 # ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
 
-if pred_vis_main is not None and not pred_vis_main.empty:
+if pred_vis_main is not None and isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty:
     buf_p = io.StringIO(); pred_vis_main.to_csv(buf_p, index=False)
     cols[0].download_button("⬇ BASE 2025 (CSV)", data=buf_p.getvalue(),
                             file_name="predweem_base_2025_clip.csv", mime="text/csv")
 
-if pred_vis_escalonado is not None and not pred_vis_escalonado.empty:
+if 'pred_vis_escalonado' in locals() and isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty:
     buf_e = io.StringIO(); pred_vis_escalonado.to_csv(buf_e, index=False)
     cols[1].download_button("⬇ HIST. ESCALONADO (CSV)", data=buf_e.getvalue(),
                             file_name="predweem_historico_escalonado.csv", mime="text/csv")
 
-if pred_vis_temprano is not None and not pred_vis_temprano.empty:
+if 'pred_vis_temprano' in locals() and isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty:
     buf_t = io.StringIO(); pred_vis_temprano.to_csv(buf_t, index=False)
     cols[2].download_button("⬇ HIST. TEMPRANO (CSV)", data=buf_t.getvalue(),
                             file_name="predweem_historico_temprano.csv", mime="text/csv")
 
-if pred_vis_medio is not None and not pred_vis_medio.empty:
+if 'pred_vis_medio' in locals() and isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty:
     buf_m = io.StringIO(); pred_vis_medio.to_csv(buf_m, index=False)
     cols[3].download_button("⬇ HIST. MEDIO (CSV)", data=buf_m.getvalue(),
                             file_name="predweem_historico_medio.csv", mime="text/csv")
@@ -608,25 +612,25 @@ def fig_to_html_bytes(fig):
     return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
 
 zip_ready = any([
-    pred_vis_main is not None and not pred_vis_main.empty,
-    pred_vis_escalonado is not None and not pred_vis_escalonado.empty,
-    pred_vis_temprano   is not None and not pred_vis_temprano.empty,
-    pred_vis_medio      is not None and not pred_vis_medio.empty,
+    isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty if 'pred_vis_main' in locals() else False,
+    isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty if 'pred_vis_escalonado' in locals() else False,
+    isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty if 'pred_vis_temprano' in locals() else False,
+    isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty if 'pred_vis_medio' in locals() else False,
 ])
 
 if zip_ready:
     with io.BytesIO() as mem:
         with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            if pred_vis_main is not None and not pred_vis_main.empty:
+            if 'pred_vis_main' in locals() and isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty:
                 _b = io.StringIO(); pred_vis_main.to_csv(_b, index=False)
                 zf.writestr("predweem_base_2025_clip.csv", _b.getvalue())
-            if pred_vis_escalonado is not None and not pred_vis_escalonado.empty:
+            if 'pred_vis_escalonado' in locals() and isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty:
                 _b = io.StringIO(); pred_vis_escalonado.to_csv(_b, index=False)
                 zf.writestr("predweem_historico_escalonado.csv", _b.getvalue())
-            if pred_vis_temprano is not None and not pred_vis_temprano.empty:
+            if 'pred_vis_temprano' in locals() and isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty:
                 _b = io.StringIO(); pred_vis_temprano.to_csv(_b, index=False)
                 zf.writestr("predweem_historico_temprano.csv", _b.getvalue())
-            if pred_vis_medio is not None and not pred_vis_medio.empty:
+            if 'pred_vis_medio' in locals() and isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty:
                 _b = io.StringIO(); pred_vis_medio.to_csv(_b, index=False)
                 zf.writestr("predweem_historico_medio.csv", _b.getvalue())
 
@@ -640,4 +644,4 @@ if zip_ready:
                 zf.writestr("grafico_historico_medio.html", fig_to_html_bytes(fig_medio))
         mem.seek(0)
         st.download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
-                           file_name="cronotrigo_predweem_base_hist3_pc.zip", mime="application/zip")
+                           file_name="cronotrigo_predweem_base_hist3_pc_tabs.zip", mime="application/zip")
