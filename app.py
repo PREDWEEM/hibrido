@@ -561,31 +561,6 @@ if pred_vis_seco is not None and len(pred_vis_seco):
 if pred_vis_humedo is not None and len(pred_vis_humedo):
     fig_humedo, metrics_humedo = render_hist_panel(pred_vis_humedo, "HISTÓRICO HÚMEDO", fill_hex="#1f77b4")
 
-# ================== NUEVO: Comparativo con históricos respecto a la BASE ==================
-def _mean_pct(metrics_list):
-    vals = [p for (_, p) in metrics_list if p is not None and not pd.isna(p)]
-    return float(np.mean(vals)) if len(vals) else np.nan
-
-if pd.notna(pct_base_value):
-    st.subheader("Comparativo con históricos (respecto a la BASE 2025)")
-    cols = st.columns(2)
-    mean_seco = _mean_pct(metrics_seco)
-    mean_humedo = _mean_pct(metrics_humedo)
-
-    if not pd.isna(mean_seco):
-        cols[0].metric("Hist. SECO — % en PC / Total (promedio)", f"{mean_seco:.0%}", 
-                       delta=(f"{(mean_seco - pct_base_value):+.0%}" if pd.notna(pct_base_value) else None))
-    else:
-        cols[0].metric("Hist. SECO — % en PC / Total (promedio)", "—")
-
-    if not pd.isna(mean_humedo):
-        cols[1].metric("Hist. HÚMEDO — % en PC / Total (promedio)", f"{mean_humedo:.0%}",
-                       delta=(f"{(mean_humedo - pct_base_value):+.0%}" if pd.notna(pct_base_value) else None))
-    else:
-        cols[1].metric("Hist. HÚMEDO — % en PC / Total (promedio)", "—")
-
-    st.caption("El promedio se calcula sobre las métricas anuales mostradas en los paneles de Histórico Seco/Húmedo.")
-
 # ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
