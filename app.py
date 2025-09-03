@@ -580,36 +580,6 @@ if pred_vis_temprano is not None and len(pred_vis_temprano):
 if pred_vis_medio is not None and len(pred_vis_medio):
     fig_medio,      metrics_medio      = render_hist_panel(pred_vis_medio,      "HISTÓRICO MEDIO",      fill_hex="#8c564b")
 
-# ================== Comparativo (NUEVO) ==================
-st.subheader("Comparativo: Promedio de % EMERREL en PC / Total vs BASE 2025")
-
-def _mean_pct(metrics_list) -> float:
-    vals = [v for (_, v) in metrics_list if pd.notna(v)]
-    return float(np.mean(vals)) if len(vals) else np.nan
-
-mean_escalonado = _mean_pct(metrics_escalonado)
-mean_temprano   = _mean_pct(metrics_temprano)
-mean_medio      = _mean_pct(metrics_medio)
-
-cols_cmp = st.columns(3)
-
-def _fmt_metric(label, mean_val, base_val):
-    if pd.notna(base_val):
-        delta_pp = (mean_val - base_val) * 100 if pd.notna(mean_val) else None
-        st.metric(label, f"{mean_val:.0%}" if pd.notna(mean_val) else "—",
-                  f"{delta_pp:+.1f} pp vs BASE" if delta_pp is not None else None)
-    else:
-        st.metric(label, f"{mean_val:.0%}" if pd.notna(mean_val) else "—")
-
-with cols_cmp[0]:
-    _fmt_metric("Promedio ESCALONADO (% en PC / Total)", mean_escalonado, pct_base_value)
-with cols_cmp[1]:
-    _fmt_metric("Promedio TEMPRANO (% en PC / Total)",   mean_temprano,   pct_base_value)
-with cols_cmp[2]:
-    _fmt_metric("Promedio MEDIO (% en PC / Total)",      mean_medio,      pct_base_value)
-
-st.caption("El delta se expresa en puntos porcentuales (pp) respecto al valor de la BASE 2025, usando el mismo PC proyectado por año.")
-
 # ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
