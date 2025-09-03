@@ -7,7 +7,7 @@
 # - Sin tabla de CRONOTRIGO; sin gráfico EMEAC
 # - Acepta históricos con columnas 'fecha' y 'EMEREL' o EMERREL/EMERAC (CSV/XLSX; openpyxl opcional)
 
-import io, re, zipfile, calendar
+import io, re, zipfile, calendar, os, tempfile
 from pathlib import Path
 
 import numpy as np
@@ -273,54 +273,65 @@ def parse_meteobahia_xml(xml_text: str) -> pd.DataFrame:
     df["Julian_days"] = df["Fecha"].dt.dayofyear
     return _sanitize_meteo(df[["Fecha","Julian_days","TMAX","TMIN","Prec"]])
 
-# ================== PERSISTENCIA BASE (local CSV + opción congelar) ==================
-LOCAL_BASE_HISTORY_PATH = st.secrets.get("LOCAL_BASE_HISTORY_PATH", "cronotrigo_predweem_base_2025_history.csv")
-DEFAULT_FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))  # valor por defecto
-
-def _load_local_base(path: str) -> pd.DataFrame:
-    p = Path(path)
-    if not p.exists():
-        return pd.DataFrame(columns=["Fecha","EMERREL(0-1)"])
-    # intenta CSV, luego XLSX
+# ================== PERSISTENCIA LOCAL (BASE) ==================
+def _resolve_base_path(default_name: str = "predweem_base_local.csv") -> Path:
+    """Devuelve una ruta escribible. Intenta secrets->ruta, luego su carpeta; si falla, cae a /tmp."""
+    cfg = st.secrets.get("LOCAL_BASE_PATH", default_name)
+    p = Path(cfg)
     try:
-        df = pd.read_csv(p, parse_dates=["Fecha"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        probe = p.parent / (p.stem + ".__probe__")
+        probe.write_text("ok", encoding="utf-8")
+        try: probe.unlink()
+        except Exception: pass
+        return p
     except Exception:
-        try:
-            df = pd.read_excel(p)
-        except Exception:
-            return pd.DataFrame(columns=["Fecha","EMERREL(0-1)"])
-    # normaliza posibles nombres
-    col_f = "Fecha" if "Fecha" in df.columns else _norm_col(df, ["fecha","date","dia"])
-    col_e = "EMERREL(0-1)" if "EMERREL(0-1)" in df.columns else _norm_col(df, ["EMERREL(0-1)","EMERREL","EMEREL","emerrel","emerel"])
-    if not col_f or not col_e:
-        return pd.DataFrame(columns=["Fecha","EMERREL(0-1)"])
-    out = pd.DataFrame({
-        "Fecha": pd.to_datetime(df[col_f], errors="coerce"),
-        "EMERREL(0-1)": pd.to_numeric(df[col_e], errors="coerce")
-    }).dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+        return Path(tempfile.gettempdir()) / Path(default_name).name
+
+def _normalize_base_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: 
+        return pd.DataFrame(columns=["Fecha","EMERREL(0-1)","EMERREL acumulado","MA5","Nivel"])
+    out = df.copy()
+    if "Fecha" in out.columns:
+        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce")
+    out = out.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    # Asegurar columnas clave si existen
+    for c in ["EMERREL(0-1)","EMERREL acumulado","MA5"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-def _save_local_base(path: str, df: pd.DataFrame) -> None:
+def _load_base_csv(path: Path) -> pd.DataFrame:
+    if not path.exists(): 
+        return pd.DataFrame(columns=["Fecha","EMERREL(0-1)","EMERREL acumulado","MA5","Nivel"])
     try:
-        df.to_csv(path, index=False, date_format="%Y-%m-%d")
+        df = pd.read_csv(path)
     except Exception:
-        pass  # no romper UI por IO
+        try:
+            df = pd.read_excel(path)
+        except Exception:
+            return pd.DataFrame(columns=["Fecha","EMERREL(0-1)","EMERREL acumulado","MA5","Nivel"])
+    return _normalize_base_df(df)
 
-def _union_base(prev: pd.DataFrame, new: pd.DataFrame, freeze_existing: bool) -> pd.DataFrame:
-    if prev is None or prev.empty:
-        base = new.copy()
-    elif new is None or new.empty:
-        base = prev.copy()
-    else:
-        keep_mode = "first" if freeze_existing else "last"
-        base = (pd.concat([prev[["Fecha","EMERREL(0-1)"]], new[["Fecha","EMERREL(0-1)"]]], ignore_index=True)
-                  .dropna(subset=["Fecha"])
-                  .sort_values("Fecha")
-                  .drop_duplicates(subset=["Fecha"], keep=keep_mode)
-                  .reset_index(drop=True))
-    # recortar al horizonte BASE
-    base = clip_horizon(base, HORIZ_INI, HORIZ_FIN) or pd.DataFrame(columns=["Fecha","EMERREL(0-1)"])
-    return base
+def _save_base_csv_atomic(path: Path, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    cols = [c for c in ["Fecha","EMERREL(0-1)","EMERREL acumulado","MA5","Nivel","Julian_days"] if c in df.columns]
+    df[cols].to_csv(tmp, index=False, date_format="%Y-%m-%d")
+    os.replace(tmp, path)
+
+def _union_by_fecha(prev: pd.DataFrame, new: pd.DataFrame, freeze_existing: bool) -> pd.DataFrame:
+    a = _normalize_base_df(prev)
+    b = _normalize_base_df(new)
+    if a.empty and b.empty: 
+        return a
+    keep = "first" if freeze_existing else "last"
+    merged = (pd.concat([a, b], ignore_index=True)
+                .dropna(subset=["Fecha"])
+                .sort_values("Fecha")
+                .drop_duplicates(subset=["Fecha"], keep=keep)
+                .reset_index(drop=True))
+    return merged
 
 # ================== Sidebar ==================
 with st.sidebar:
@@ -341,16 +352,6 @@ with st.sidebar:
     pred_file = st.file_uploader("Archivo BASE (CSV/XLSX)", type=["csv","xlsx"], key="pred_up") if modo_pred=="Subir archivo (EMERREL/EMERAC)" else None
     meteo_url = st.text_input("URL XML", value="https://meteobahia.com.ar/scripts/forecast/for-bd.xml") if modo_pred=="API MeteoBahía (XML)" else None
 
-    # >>> NUEVO: sección Persistencia BASE
-    st.markdown("---")
-    st.header("Persistencia BASE (local)")
-    freeze_history = st.checkbox(
-        "Congelar histórico local (no sobrescribir)",
-        value=DEFAULT_FREEZE_HISTORY,
-        help="Si está activado, al guardar el histórico BASE no se pisan valores existentes por fecha."
-    )
-    st.caption(f"Archivo local: `{LOCAL_BASE_HISTORY_PATH}`")
-
     st.markdown("---")
     st.header("PREDWEEM · Históricos (archivos aparte)")
     st.caption("Formato simple aceptado: columnas **fecha** y **EMEREL**, o EMERREL/EMERAC (CSV/XLSX).")
@@ -358,6 +359,16 @@ with st.sidebar:
     hist_temprano_file   = st.file_uploader("HISTÓRICO TEMPRANO (CSV/XLSX)",   type=["csv","xlsx"], key="hist_temprano")
     hist_medio_file      = st.file_uploader("HISTÓRICO MEDIO (CSV/XLSX)",      type=["csv","xlsx"], key="hist_medio")
     st.caption("💡 Para XLSX, instalá 'openpyxl'; con CSV no hace falta.")
+
+    st.markdown("---")
+    st.header("Persistencia (BASE)")
+    persist_on = st.checkbox("Guardar BASE local (CSV)", value=True)
+    freeze_default = bool(st.secrets.get("FREEZE_BASE", False))
+    FREEZE_BASE = st.checkbox("Congelar BASE (no sobrescribir)", value=freeze_default,
+                              help="Si está activo, conserva lo ya guardado para cada fecha.")
+    default_path = _resolve_base_path()
+    LOCAL_BASE_PATH = Path(st.text_input("Ruta archivo", value=str(default_path)))
+    st.caption(f"Destino: {LOCAL_BASE_PATH}")
 
 # ================== CRONOTRIGO: Visualización / PC (origen base) ==================
 st.subheader("CRONOTRIGO – Resultados FAUBA (para BASE 2025)")
@@ -385,7 +396,7 @@ else:
             pc_inicio, pc_fin = p1, p2
             st.success("HTML leído y PC detectado (si estaba presente).")
         except Exception as e:
-            st.error(f"No se pudo procesar el HTML subido: {e}")
+            st.error(f"No pude procesar el HTML subido: {e}")
     else:
         st.info("Subí el archivo HTML para continuar.")
 
@@ -430,31 +441,11 @@ except RuntimeError as e:
 except Exception as e:
     st.error(f"No se pudo generar la serie BASE: {e}")
 
-# --- Recorte de horizonte SOLO para la BASE + PERSISTENCIA LOCAL ---
+# --- Recorte de horizonte SOLO para la BASE ---
 if pred_vis_main is not None:
     pred_vis_main = clip_horizon(pred_vis_main, HORIZ_INI, HORIZ_FIN)
     if pred_vis_main.empty:
         st.warning("No hay datos BASE en 01/02/2025 → 01/11/2025.")
-    else:
-        try:
-            # 1) cargar histórico local (si existe)
-            prev_local = _load_local_base(LOCAL_BASE_HISTORY_PATH)
-            # 2) preparar “nuevos” (solo columnas clave)
-            new_clip = pred_vis_main[["Fecha","EMERREL(0-1)"]].copy()
-            # 3) unir según política (congelar o sobrescribir)
-            union_clip = _union_base(prev_local, new_clip, freeze_existing=freeze_history)
-            # 4) guardar en disco (solo horizonte BASE)
-            _save_local_base(LOCAL_BASE_HISTORY_PATH, union_clip)
-            # 5) reconstruir pred_vis_main desde union_clip para asegurar consistencia en MA5/Acum/Nivel
-            pred_vis_main = union_clip.copy()
-            pred_vis_main["EMERREL acumulado"] = pred_vis_main["EMERREL(0-1)"].cumsum().clip(upper=1.0)
-            pred_vis_main["MA5"] = pred_vis_main["EMERREL(0-1)"].rolling(5, min_periods=1).mean()
-            if "Nivel" not in pred_vis_main.columns:
-                pred_vis_main["Nivel"] = np.where(pred_vis_main["EMERREL(0-1)"] <= THR_BAJO_MEDIO, "Bajo",
-                                           np.where(pred_vis_main["EMERREL(0-1)"] <= THR_MEDIO_ALTO, "Medio", "Alto"))
-            st.caption(f"Histórico BASE local actualizado · congelar={freeze_history} · archivo: {LOCAL_BASE_HISTORY_PATH}")
-        except Exception:
-            st.warning("No se pudo persistir la BASE localmente. Continuando sin persistencia…")
 
 # Ajustar PC al horizonte de la BASE
 pc_inicio, pc_fin = clip_pc(pc_inicio, pc_fin, HORIZ_INI, HORIZ_FIN)
@@ -497,6 +488,17 @@ def compute_overlap(pred_df: pd.DataFrame, pc_i, pc_f):
 def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=("Alto","#d62728")):
     mp = {pal[0]: pal[1], pb[0]: pb[1], pa[0]: pa[1]}
     return serie.map(mp).fillna("#808080").to_numpy()
+
+# ================== Persistencia BASE: guardar/leer/merge ==================
+if pred_vis_main is not None and not pred_vis_main.empty and persist_on:
+    try:
+        prev_base = _load_base_csv(LOCAL_BASE_PATH)
+        merged_base = _union_by_fecha(prev_base, pred_vis_main, freeze_existing=FREEZE_BASE)
+        _save_base_csv_atomic(LOCAL_BASE_PATH, merged_base)
+        pred_vis_main = merged_base  # usar consolidado
+        st.caption(f"BASE persistida en: {LOCAL_BASE_PATH} · Filas: {len(pred_vis_main)}")
+    except Exception as e:
+        st.warning(f"No se pudo persistir la BASE localmente. Continuando sin persistencia…\nDetalle: {e}")
 
 # ================== Grafico BASE (2025) + métrica ==================
 fig_base = None
@@ -570,3 +572,157 @@ def render_hist_panel(hist_plot: pd.DataFrame | None, titulo: str, fill_hex: str
                 customdata=dfp["Nivel"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
                 hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
                 name=f"{titulo} · EMERREL (0-1)")
+    fig.add_hline(y=THR_BAJO_MEDIO, line_dash="dot", opacity=0.6, annotation_text=f"Bajo ≤ {THR_BAJO_MEDIO:.3f}")
+    fig.add_hline(y=THR_MEDIO_ALTO, line_dash="dot", opacity=0.6, annotation_text=f"Medio ≤ {THR_MEDIO_ALTO:.3f}")
+
+    # Proyección del PC BASE a cada año del histórico + sombreado y métrica por año
+    hist_years = sorted(pd.unique(dfp["Fecha"].dt.year.dropna()))
+    pc_metrics = []  # (year, pct)
+    for y in hist_years:
+        if pc_inicio is None or pc_fin is None:
+            continue
+        h_i, h_f = project_pc_to_year(pc_inicio, pc_fin, int(y))
+        add_pc_shading(fig, h_i, h_f, label=f"PC {y}")
+        sub_year = dfp[(dfp["Fecha"].dt.year == y)].copy()
+        if not sub_year.empty:
+            _, resy = compute_overlap(sub_year, h_i, h_f)
+            pc_metrics.append((int(y), resy.get("% EMERREL en PC / total", np.nan)))
+
+    fig.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified",
+                      height=520, legend_title="Referencias")
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+
+    # Métricas por año
+    st.caption("Métricas por año:")
+    if pc_metrics:
+        for i in range(0, len(pc_metrics), 4):
+            row = pc_metrics[i:i+4]
+            cols = st.columns(len(row))
+            for (j, (yy, pct)) in enumerate(row):
+                cols[j].metric(f"% en PC / Total ({titulo} {yy})", f"{pct:.0%}" if pd.notna(pct) else "—")
+    else:
+        st.info("No fue posible calcular métricas (verificá fechas o PC).")
+
+    return fig, pc_metrics
+
+# ================== Render en TABS: HISTÓRICO ESCALONADO / TEMPRANO / MEDIO ==================
+fig_escalonado = fig_temprano = fig_medio = None
+metrics_escalonado = metrics_temprano = metrics_medio = []
+
+tab_escalonado, tab_temprano, tab_medio = st.tabs(["Escalonado", "Temprano", "Medio"])
+
+with tab_escalonado:
+    if hist_escalonado_file is not None:
+        try:
+            pred_vis_escalonado = run_predweem_from_file(hist_escalonado_file)
+            st.success(f"HISTÓRICO ESCALONADO cargado: {len(pred_vis_escalonado)} días.")
+            fig_escalonado, metrics_escalonado = render_hist_panel(
+                pred_vis_escalonado, "HISTÓRICO ESCALONADO", fill_hex="#9467bd"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO ESCALONADO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO ESCALONADO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Escalonado** para ver este panel.")
+
+with tab_temprano:
+    if hist_temprano_file is not None:
+        try:
+            pred_vis_temprano = run_predweem_from_file(hist_temprano_file)
+            st.success(f"HISTÓRICO TEMPRANO cargado: {len(pred_vis_temprano)} días.")
+            fig_temprano, metrics_temprano = render_hist_panel(
+                pred_vis_temprano, "HISTÓRICO TEMPRANO", fill_hex="#1f77b4"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO TEMPRANO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO TEMPRANO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Temprano** para ver este panel.")
+
+with tab_medio:
+    if hist_medio_file is not None:
+        try:
+            pred_vis_medio = run_predweem_from_file(hist_medio_file)
+            st.success(f"HISTÓRICO MEDIO cargado: {len(pred_vis_medio)} días.")
+            fig_medio, metrics_medio = render_hist_panel(
+                pred_vis_medio, "HISTÓRICO MEDIO", fill_hex="#8c564b"
+            )
+        except RuntimeError as e:
+            if "OPENPYXL_MISSING" in str(e):
+                st.warning("No se pudo leer el HISTÓRICO MEDIO: falta 'openpyxl' para XLSX. Subí el histórico en CSV.")
+            else:
+                st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
+        except Exception as e:
+            st.error(f"No se pudo leer el HISTÓRICO MEDIO: {e}")
+    else:
+        st.info("Subí el archivo de **Histórico Medio** para ver este panel.")
+
+# ================== Descargas ==================
+st.subheader("Descargas")
+cols = st.columns(4)
+
+if pred_vis_main is not None and isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty:
+    buf_p = io.StringIO(); pred_vis_main.to_csv(buf_p, index=False)
+    cols[0].download_button("⬇ BASE 2025 (CSV)", data=buf_p.getvalue(),
+                            file_name="predweem_base_2025_clip.csv", mime="text/csv")
+
+if 'pred_vis_escalonado' in locals() and isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty:
+    buf_e = io.StringIO(); pred_vis_escalonado.to_csv(buf_e, index=False)
+    cols[1].download_button("⬇ HIST. ESCALONADO (CSV)", data=buf_e.getvalue(),
+                            file_name="predweem_historico_escalonado.csv", mime="text/csv")
+
+if 'pred_vis_temprano' in locals() and isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty:
+    buf_t = io.StringIO(); pred_vis_temprano.to_csv(buf_t, index=False)
+    cols[2].download_button("⬇ HIST. TEMPRANO (CSV)", data=buf_t.getvalue(),
+                            file_name="predweem_historico_temprano.csv", mime="text/csv")
+
+if 'pred_vis_medio' in locals() and isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty:
+    buf_m = io.StringIO(); pred_vis_medio.to_csv(buf_m, index=False)
+    cols[3].download_button("⬇ HIST. MEDIO (CSV)", data=buf_m.getvalue(),
+                            file_name="predweem_historico_medio.csv", mime="text/csv")
+
+def fig_to_html_bytes(fig):
+    return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
+
+zip_ready = any([
+    isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty if 'pred_vis_main' in locals() else False,
+    isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty if 'pred_vis_escalonado' in locals() else False,
+    isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty if 'pred_vis_temprano' in locals() else False,
+    isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty if 'pred_vis_medio' in locals() else False,
+])
+
+if zip_ready:
+    with io.BytesIO() as mem:
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            if 'pred_vis_main' in locals() and isinstance(pred_vis_main, pd.DataFrame) and not pred_vis_main.empty:
+                _b = io.StringIO(); pred_vis_main.to_csv(_b, index=False)
+                zf.writestr("predweem_base_2025_clip.csv", _b.getvalue())
+            if 'pred_vis_escalonado' in locals() and isinstance(pred_vis_escalonado, pd.DataFrame) and not pred_vis_escalonado.empty:
+                _b = io.StringIO(); pred_vis_escalonado.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_escalonado.csv", _b.getvalue())
+            if 'pred_vis_temprano' in locals() and isinstance(pred_vis_temprano, pd.DataFrame) and not pred_vis_temprano.empty:
+                _b = io.StringIO(); pred_vis_temprano.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_temprano.csv", _b.getvalue())
+            if 'pred_vis_medio' in locals() and isinstance(pred_vis_medio, pd.DataFrame) and not pred_vis_medio.empty:
+                _b = io.StringIO(); pred_vis_medio.to_csv(_b, index=False)
+                zf.writestr("predweem_historico_medio.csv", _b.getvalue())
+
+            if 'fig_base' in locals() and fig_base is not None:
+                zf.writestr("grafico_base_2025.html", fig_to_html_bytes(fig_base))
+            if 'fig_escalonado' in locals() and fig_escalonado is not None:
+                zf.writestr("grafico_historico_escalonado.html", fig_to_html_bytes(fig_escalonado))
+            if 'fig_temprano' in locals() and fig_temprano is not None:
+                zf.writestr("grafico_historico_temprano.html", fig_to_html_bytes(fig_temprano))
+            if 'fig_medio' in locals() and fig_medio is not None:
+                zf.writestr("grafico_historico_medio.html", fig_to_html_bytes(fig_medio))
+        mem.seek(0)
+        st.download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
+                           file_name="cronotrigo_predweem_base_hist3_pc_tabs.zip", mime="application/zip")
