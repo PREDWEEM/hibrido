@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# app_cronotrigo_predweem_base_2025_hist_seco_humedo_pc.py
+# app_cronotrigo_predweem_base_2025_hist_seco_humedo_pc_compare.py
 # CRONOTRIGO (web) + PREDWEEM:
 # - Serie BASE (2025) con % EMERREL en PC / Total y sombreado del PC
-# - Serie HISTÓRICO SECO y HISTÓRICO HÚMEDO (otros años) con PC proyectado por año y métricas por año
-# - Paneles separados (BASE, HIST SECO, HIST HÚMEDO)
-# - Sin tabla visual de CRONOTRIGO; sin gráfico de EMEAC
-# - Acepta histórico(s) con columnas 'fecha' y 'EMEREL' o EMERREL/EMERAC
-# - Manejo robusto CSV/XLSX (openpyxl opcional para XLSX)
+# - Series HISTÓRICO SECO y HISTÓRICO HÚMEDO (otros años) con PC proyectado por año y métricas por año
+# - NUEVO: Comparativo — para el caso BASE se calcula el promedio de % en PC / Total de SECO y HÚMEDO por separado,
+#          mostrando delta respecto a la BASE 2025
+# - Sin tabla de CRONOTRIGO; sin gráfico EMEAC
+# - Acepta históricos con columnas 'fecha' y 'EMEREL' o EMERREL/EMERAC (CSV/XLSX; openpyxl opcional)
 
 import io, re, zipfile, calendar
 from pathlib import Path
@@ -27,7 +27,7 @@ except Exception:
     _BS4_OK = False
 
 # ================== UI ==================
-st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Base 2025 + Hist Seco/Húmedo con PC", layout="wide")
+st.set_page_config(page_title="CRONOTRIGO + PREDWEEM · Base 2025 + Hist Seco/Húmedo (PC)", layout="wide")
 st.markdown("""
 <style>
 #MainMenu{visibility:hidden} footer{visibility:hidden}
@@ -282,7 +282,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Período Crítico (PC)")
-    st.caption("Si no se detecta desde el HTML, podés ingresarlo manualmente (aplica a BASE y se proyecta al HISTÓRICO).")
+    st.caption("Si no se detecta desde el HTML, podés ingresarlo manualmente (aplica a BASE y se proyecta a los HISTÓRICOS).")
     pc_manual_on = st.checkbox("Ingresar PC manualmente si no se detecta", value=True)
     pc_ini_manual = st.date_input("Inicio PC (manual)", value=None, format="DD/MM/YYYY")
     pc_fin_manual = st.date_input("Fin PC (manual)", value=None, format="DD/MM/YYYY")
@@ -450,6 +450,7 @@ def colores_por_nivel(serie, pal=("Bajo","#2ca02c"), pb=("Medio","#ff7f0e"), pa=
 fig_base = None
 overlap_base_df = pd.DataFrame()
 overlap_base_res = {}
+pct_base_value = np.nan
 
 if pred_vis_main is not None and len(pred_vis_main):
     base_plot = pred_vis_main.copy()
@@ -485,8 +486,8 @@ if pred_vis_main is not None and len(pred_vis_main):
     st.subheader("Resultado (BASE)")
     if pc_inicio is not None and pc_fin is not None and pc_inicio < pc_fin:
         overlap_base_df, overlap_base_res = compute_overlap(base_plot, pc_inicio, pc_fin)
-        pct_base = overlap_base_res.get("% EMERREL en PC / total", np.nan)
-        st.metric("% EMERREL en PC / Total (BASE 2025)", f"{pct_base:.0%}" if pd.notna(pct_base) else "—")
+        pct_base_value = overlap_base_res.get("% EMERREL en PC / total", np.nan)
+        st.metric("% EMERREL en PC / Total (BASE 2025)", f"{pct_base_value:.0%}" if pd.notna(pct_base_value) else "—")
         st.caption(f"PC BASE: {pc_inicio.date().strftime('%d/%m/%Y')} → {pc_fin.date().strftime('%d/%m/%Y')} · Días: {(pc_fin - pc_inicio).days + 1}")
     else:
         st.warning("PC inválido o fuera del horizonte para la BASE.")
@@ -560,6 +561,31 @@ if pred_vis_seco is not None and len(pred_vis_seco):
 if pred_vis_humedo is not None and len(pred_vis_humedo):
     fig_humedo, metrics_humedo = render_hist_panel(pred_vis_humedo, "HISTÓRICO HÚMEDO", fill_hex="#1f77b4")
 
+# ================== NUEVO: Comparativo con históricos respecto a la BASE ==================
+def _mean_pct(metrics_list):
+    vals = [p for (_, p) in metrics_list if p is not None and not pd.isna(p)]
+    return float(np.mean(vals)) if len(vals) else np.nan
+
+if pd.notna(pct_base_value):
+    st.subheader("Comparativo con históricos (respecto a la BASE 2025)")
+    cols = st.columns(2)
+    mean_seco = _mean_pct(metrics_seco)
+    mean_humedo = _mean_pct(metrics_humedo)
+
+    if not pd.isna(mean_seco):
+        cols[0].metric("Hist. SECO — % en PC / Total (promedio)", f"{mean_seco:.0%}", 
+                       delta=(f"{(mean_seco - pct_base_value):+.0%}" if pd.notna(pct_base_value) else None))
+    else:
+        cols[0].metric("Hist. SECO — % en PC / Total (promedio)", "—")
+
+    if not pd.isna(mean_humedo):
+        cols[1].metric("Hist. HÚMEDO — % en PC / Total (promedio)", f"{mean_humedo:.0%}",
+                       delta=(f"{(mean_humedo - pct_base_value):+.0%}" if pd.notna(pct_base_value) else None))
+    else:
+        cols[1].metric("Hist. HÚMEDO — % en PC / Total (promedio)", "—")
+
+    st.caption("El promedio se calcula sobre las métricas anuales mostradas en los paneles de Histórico Seco/Húmedo.")
+
 # ================== Descargas ==================
 st.subheader("Descargas")
 cols = st.columns(4)
@@ -609,4 +635,5 @@ if zip_ready:
         mem.seek(0)
         cols[3].download_button("⬇ Descargar TODO (ZIP)", data=mem.read(),
                                 file_name="cronotrigo_predweem_base_seco_humedo_pc.zip", mime="application/zip")
+
 
